@@ -1,4 +1,4 @@
-from .constraints import ConstraintChecker, ConstraintSet
+from .constraints import ConstraintChecker, ConstraintSet, ConstraintViolation
 from .cost_estimator import CostEstimator
 from .orchestrator import ContextOrchestrator, OrchestratorResult
 from .planner import ContextPlan
@@ -6,6 +6,7 @@ from .planner import ContextPlan
 __all__ = [
     "ConstraintChecker",
     "ConstraintSet",
+    "ConstraintViolation",
     "ContextOrchestrator",
     "ContextPlan",
     "CostEstimator",

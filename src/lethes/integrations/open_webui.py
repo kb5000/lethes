@@ -29,7 +29,10 @@ from ..models.pricing import ModelPricingTable
 from ..summarizers.levels import TurnSummarizer
 from ..summarizers.llm import LLMSummarizer
 from ..utils.tokens import TokenCounter
+from ..weighting.composite import CompositeWeightStrategy
 from ..weighting.keyword import KeywordRelevanceStrategy
+from ..weighting.llm_analyzer import LLMContextAnalyzer
+from ..weighting.smart import SmartWeightingStrategy
 from ..weighting.static import StaticWeightStrategy
 
 logger = logging.getLogger(__name__)
@@ -56,15 +59,50 @@ class OpenWebUIFilter:
             "greedy_by_weight",
             "recency_biased",
             "dependency_aware",
-        ] = Field(default="greedy_by_weight", description="Context selection algorithm")
+        ] = Field(
+            default="recency_biased",
+            description=(
+                "Context selection algorithm. "
+                "'recency_biased' (default) prioritises recent messages; "
+                "'greedy_by_weight' picks by relevance score alone; "
+                "'dependency_aware' enforces explicit dependency chains."
+            ),
+        )
         recency_factor: float = Field(
-            default=2.0,
-            description="Recency bias factor (only used with recency_biased algorithm)",
+            default=1.5,
+            description=(
+                "Recency bias strength for 'recency_biased' algorithm. "
+                "0 = no bias; 1.5 = newest message has 2.5× the weight of oldest. "
+                "Increase for stronger recency preference."
+            ),
         )
-        weighting: Literal["static", "keyword"] = Field(
-            default="keyword",
-            description="Message relevance weighting strategy",
+        weighting: Literal["static", "keyword", "smart"] = Field(
+            default="smart",
+            description=(
+                "Message relevance weighting strategy. "
+                "'smart' (default) combines keyword relevance, Q&A pair coherence, "
+                "and tool-call penalties. "
+                "'keyword' uses BM25/overlap only. "
+                "'static' disables relevance scoring."
+            ),
         )
+        tool_penalty: float = Field(
+            default=0.5,
+            description=(
+                "Weight multiplier for tool-call intermediate messages "
+                "(role='tool' or assistant messages with tool_calls). "
+                "0.5 = half the weight of regular messages. 1.0 = no penalty."
+            ),
+        )
+        pair_coherence: float = Field(
+            default=0.8,
+            description=(
+                "Fraction of a user message's relevance score transferred to its "
+                "following assistant reply (0.0 – 1.0). "
+                "Higher values keep Q&A pairs together more aggressively."
+            ),
+        )
+        # ── Summarisation ─────────────────────────────────────────────────
         summary_api_base: str = Field(
             default="https://api.openai.com/v1",
             description="OpenAI-compatible API base URL for summarisation",
@@ -73,8 +111,28 @@ class OpenWebUIFilter:
         summary_model: str = Field(default="gpt-4o-mini", description="Model used for summarisation")
         summary_target_ratio: float = Field(default=0.3, description="Summarisation compression ratio")
         retry_attempts: int = Field(default=3, description="Retry attempts for summarisation")
+        nosum_by_default: bool = Field(default=False, description="Disable summarisation globally")
+        # ── LLM context analyser (sub-agent) ──────────────────────────────
+        llm_analysis: bool = Field(
+            default=False,
+            description=(
+                "Enable LLM-powered context analysis (sub-agent). "
+                "When enabled, a fast LLM scores each message's importance for "
+                "the current query. Uses summary_api_key and summary_model. "
+                "Adds ~200–400 ms latency; results are cached."
+            ),
+        )
+        llm_analysis_weight: float = Field(
+            default=0.6,
+            description=(
+                "Weight of the LLM analysis score in the composite weighting "
+                "(1 − llm_analysis_weight goes to the base weighting strategy). "
+                "Only used when llm_analysis=True."
+            ),
+        )
+        # ── Cache ─────────────────────────────────────────────────────────
         cache_backend: Literal["memory", "redis"] = Field(
-            default="memory", description="Cache backend for summaries"
+            default="memory", description="Cache backend for summaries and embeddings"
         )
         redis_url: str = Field(
             default="redis://redis:6379/0", description="Redis URL (only used with redis cache)"
@@ -82,7 +140,6 @@ class OpenWebUIFilter:
         pricing_config_path: str = Field(
             default="", description="Path to custom pricing JSON (leave empty for defaults)"
         )
-        nosum_by_default: bool = Field(default=False, description="Disable summarisation globally")
 
     def __init__(self) -> None:
         self.valves = self.Valves()
@@ -176,11 +233,15 @@ class OpenWebUIFilter:
             self.valves.algorithm,
             self.valves.recency_factor,
             self.valves.weighting,
+            self.valves.tool_penalty,
+            self.valves.pair_coherence,
             self.valves.summary_api_base,
             self.valves.summary_model,
             self.valves.cache_backend,
             self.valves.redis_url,
             self.valves.nosum_by_default,
+            self.valves.llm_analysis,
+            self.valves.llm_analysis_weight,
         )
         if self._orchestrator is not None and self._orchestrator_config_key == config_key:
             return self._orchestrator
@@ -215,11 +276,31 @@ class OpenWebUIFilter:
         else:
             algo = base_algo
 
-        # Weighting
+        # Base weighting strategy
         if self.valves.weighting == "keyword":
-            weighting = KeywordRelevanceStrategy()
+            base_weighting = KeywordRelevanceStrategy()
+        elif self.valves.weighting == "smart":
+            base_weighting = SmartWeightingStrategy(
+                tool_penalty=self.valves.tool_penalty,
+                pair_coherence=self.valves.pair_coherence,
+            )
         else:
-            weighting = StaticWeightStrategy()
+            base_weighting = StaticWeightStrategy()
+
+        # Optionally wrap with LLM context analyser
+        weighting = base_weighting
+        if self.valves.llm_analysis and self.valves.summary_api_key:
+            analyzer = LLMContextAnalyzer(
+                api_base=self.valves.summary_api_base,
+                api_key=self.valves.summary_api_key,
+                model=self.valves.summary_model,
+                cache=cache,
+            )
+            w = self.valves.llm_analysis_weight
+            weighting = CompositeWeightStrategy([
+                (base_weighting, 1.0 - w),
+                (analyzer, w),
+            ])
 
         # Pricing
         pricing: ModelPricingTable | None = None

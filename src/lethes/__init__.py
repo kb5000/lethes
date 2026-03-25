@@ -23,8 +23,9 @@ Open WebUI integration::
     from lethes.integrations.open_webui import OpenWebUIFilter as Filter
 """
 
+from .engine.constraints import ConstraintViolation
 from .engine.orchestrator import ContextOrchestrator, OrchestratorResult
-from .models.budget import Budget, CompositeBudget, CostBudget, TokenBudget
+from .models.budget import Budget, CompositeBudget, CostBudget, TokenBudget, TokenTargetBudget
 from .models.conversation import Conversation
 from .models.message import Message
 from .models.pricing import ModelPricingEntry, ModelPricingTable
@@ -40,6 +41,9 @@ __all__ = [
     "CompositeBudget",
     "CostBudget",
     "TokenBudget",
+    "TokenTargetBudget",
+    # Engine
+    "ConstraintViolation",
     # Pricing
     "ModelPricingEntry",
     "ModelPricingTable",

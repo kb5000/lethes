@@ -33,19 +33,37 @@ class TokenCounter:
         return len(self._encoding.encode(text))
 
     def count(self, message: "Message") -> int:
-        """Count tokens for a :class:`~lethes.models.message.Message`."""
+        """
+        Count tokens for a :class:`~lethes.models.message.Message`.
+
+        Includes text from ``content`` (all text blocks in multimodal messages)
+        plus the JSON representation of ``tool_calls`` when present.
+        """
+        import json
+
         from ..utils.content import get_text_content
 
         if message.token_count is not None:
             return message.token_count
-        text = get_text_content(message.content)
-        return self.count_text(text)
+        parts = [get_text_content(message.content)]
+        if message.tool_calls:
+            parts.append(json.dumps(message.tool_calls, ensure_ascii=False))
+        return self.count_text(" ".join(p for p in parts if p))
 
     def count_dict(self, message: dict) -> int:
-        """Count tokens for a raw OpenAI message dict."""
+        """
+        Count tokens for a raw OpenAI message dict.
+
+        Includes ``content`` text and ``tool_calls`` JSON when present.
+        """
+        import json
+
         from ..utils.content import get_text_content
 
-        return self.count_text(get_text_content(message.get("content", "")))
+        parts = [get_text_content(message.get("content"))]
+        if message.get("tool_calls"):
+            parts.append(json.dumps(message["tool_calls"], ensure_ascii=False))
+        return self.count_text(" ".join(p for p in parts if p))
 
     def fill_counts(self, messages: list["Message"]) -> list["Message"]:
         """

@@ -43,12 +43,21 @@ class Conversation:
     ) -> "Conversation":
         """
         Convert a list of OpenAI-format dicts into a :class:`Conversation`.
+
         ``msg_kwargs`` are forwarded to every :class:`Message` constructor call.
+
+        **Tool call dependency linking** — bidirectional dependencies are
+        automatically set between assistant ``tool_calls`` messages and their
+        corresponding ``tool`` result messages.  This ensures the orchestration
+        engine always keeps or drops the pair together, preventing invalid
+        sequences where a tool result appears without its preceding tool call
+        (or vice versa), which the OpenAI API rejects.
         """
         objs = [
             Message.from_dict(d, sequence_index=i, **msg_kwargs)
             for i, d in enumerate(messages)
         ]
+        objs = _link_tool_dependencies(objs)
         return cls(objs, session_id=session_id)
 
     def to_openai_messages(self) -> list[dict[str, Any]]:
@@ -138,3 +147,65 @@ def _with_index(message: Message, index: int) -> Message:
     if message.sequence_index == index:
         return message
     return dataclasses.replace(message, sequence_index=index)
+
+
+def _link_tool_dependencies(messages: list[Message]) -> list[Message]:
+    """
+    Auto-set bidirectional dependencies between tool-call and tool-result messages.
+
+    For each ``tool`` result message, its ``tool_call_id`` is matched against
+    ``tool_calls[*].id`` in preceding ``assistant`` messages.  The matched pair
+    gets mutual ``dependencies`` entries so the orchestration engine always
+    keeps or drops them together.
+
+    This runs once at parse time (``from_openai_messages``).  Messages that
+    already have explicit ``dependencies`` set are left untouched for those
+    entries; the auto-linked IDs are appended.
+    """
+    import dataclasses
+
+    # Build maps needed for cross-referencing
+    # tool_call_id → id of the tool-result Message
+    result_by_call_id: dict[str, str] = {}
+    for msg in messages:
+        if msg.role == "tool" and msg.tool_call_id:
+            result_by_call_id[msg.tool_call_id] = msg.id
+
+    # assistant message id → list of tool-result message ids
+    assistant_results: dict[str, list[str]] = {}
+    for msg in messages:
+        if msg.role == "assistant" and msg.tool_calls:
+            linked = [
+                result_by_call_id[tc["id"]]
+                for tc in msg.tool_calls
+                if isinstance(tc, dict) and tc.get("id") in result_by_call_id
+            ]
+            if linked:
+                assistant_results[msg.id] = linked
+
+    # tool_call_id → id of the assistant Message that issued it
+    assistant_by_call_id: dict[str, str] = {}
+    for msg in messages:
+        if msg.role == "assistant" and msg.tool_calls:
+            for tc in msg.tool_calls:
+                if isinstance(tc, dict) and tc.get("id"):
+                    assistant_by_call_id[tc["id"]] = msg.id
+
+    if not assistant_results and not assistant_by_call_id:
+        return messages
+
+    updated: dict[str, Message] = {}
+
+    for msg in messages:
+        if msg.role == "assistant" and msg.id in assistant_results:
+            extra = assistant_results[msg.id]
+            new_deps = list(dict.fromkeys(msg.dependencies + extra))
+            updated[msg.id] = dataclasses.replace(msg, dependencies=new_deps)
+
+        if msg.role == "tool" and msg.tool_call_id:
+            asst_id = assistant_by_call_id.get(msg.tool_call_id)
+            if asst_id:
+                new_deps = list(dict.fromkeys(msg.dependencies + [asst_id]))
+                updated[msg.id] = dataclasses.replace(msg, dependencies=new_deps)
+
+    return [updated.get(m.id, m) for m in messages]

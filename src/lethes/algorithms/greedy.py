@@ -79,8 +79,14 @@ class GreedyByWeightAlgorithm:
                 if headroom >= 0:
                     headroom -= tokens
             else:
-                # Try summary first
-                if self._prefer_summarize and msg.summary is not None:
+                # Try summary first — but never summarize tool call pairs,
+                # since they must remain structurally intact for the API.
+                is_tool_pair = msg.role == "tool" or bool(msg.tool_calls)
+                if (
+                    self._prefer_summarize
+                    and msg.summary is not None
+                    and not is_tool_pair
+                ):
                     summary_tokens = token_counter.count_text(msg.summary)
                     if headroom < 0 or summary_tokens <= headroom:
                         summarize.append(msg.id)

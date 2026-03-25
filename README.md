@@ -28,6 +28,8 @@
 - **用户可控** — 在对话中直接用 flag 语法精确控制编排行为
 - **多级摘要** — Turn 级、段落级、对话级三层压缩，而非简单删除
 - **KV 缓存优化** — 追踪历史发送序列，最大化前缀命中，降低 API 成本
+- **工具调用感知** — 完整支持 OpenAI tool calls 格式；自动绑定 assistant/tool 消息对的依赖关系，确保上下文截断后序列仍合法
+- **多模态就绪** — 原生支持 `image_url` 内容块（URL 及 base64 格式），编排时自动提取文本，图像块透明透传
 - **无厂商绑定** — 摘要和嵌入通过标准 OpenAI 兼容接口调用，支持 Ollama、vLLM 等
 
 ---
@@ -62,6 +64,34 @@ result = await orchestrator.process(
 
 ready_messages = result.conversation.to_openai_messages()
 # → 标准 OpenAI 格式，可直接传给任何 LLM
+```
+
+`raw_messages` 可以包含任意 OpenAI 消息格式：
+
+```python
+messages = [
+    # 普通文本
+    {"role": "user", "content": "今天天气怎样？"},
+
+    # 工具调用（assistant → content 为 null）
+    {"role": "assistant", "content": None, "tool_calls": [{
+        "id": "call_abc", "type": "function",
+        "function": {"name": "get_weather", "arguments": '{"city":"Paris"}'}
+    }]},
+
+    # 工具返回结果
+    {"role": "tool", "tool_call_id": "call_abc",
+     "name": "get_weather", "content": "22°C, 多云"},
+
+    # 多模态（图片 + 文字）
+    {"role": "user", "content": [
+        {"type": "text", "text": "这张图里有什么？"},
+        {"type": "image_url", "image_url": {
+            "url": "data:image/png;base64,iVBOR...",
+            "detail": "high"
+        }},
+    ]},
+]
 ```
 
 ### 完整配置
@@ -108,6 +138,143 @@ orchestrator = ContextOrchestrator(
 
 ---
 
+## 工具调用与多模态
+
+### 工具调用（Tool Calls）
+
+lethes 完整支持 OpenAI tool calls 格式，无需任何额外配置：
+
+```
+用户消息
+  ↓
+assistant (content=null, tool_calls=[{id, type, function}])  ← 自动设为对方的依赖
+  ↓
+tool (tool_call_id=..., content="结果")                       ← 自动设为对方的依赖
+  ↓
+assistant ("根据工具结果，答案是…")
+```
+
+**关键保证：**
+
+| 问题 | lethes 的处理 |
+|---|---|
+| tool result 被保留，但 assistant tool_calls 被截断 | ConstraintChecker 自动将 assistant 提升到 keep |
+| assistant tool_calls 被保留，但 tool result 被截断 | ConstraintChecker 自动将 tool result 提升到 keep |
+| tool 消息有预计算摘要，算法想摘要它 | 拒绝摘要，改为 drop（工具对不可拆分） |
+| 一次调用多个并行工具 | 全部双向绑定，整组保持一致 |
+
+依赖关系在 `Conversation.from_openai_messages` 解析时**自动注入**，无需手工设置。
+
+### 多模态消息（图片）
+
+```python
+# URL 格式
+{"type": "image_url", "image_url": {"url": "https://example.com/img.jpg"}}
+
+# Base64 格式（data URI）
+{"type": "image_url", "image_url": {
+    "url": "data:image/png;base64,iVBOR...",
+    "detail": "high"   # "low" | "high" | "auto"
+}}
+```
+
+- 编排时提取 `type=text` 块做权重计算和摘要
+- 图片块（`image_url`、`image` 等）**原样透传**，不被修改或丢弃
+- 包含图片的消息的词元计数只统计文字部分（图片 token 由 API 自行计算）
+
+---
+
+## 编排逻辑详解
+
+### 消息重要性评分公式
+
+每条消息的最终权重由三个因子相乘得到：
+
+```
+weight = base_weight × relevance_score × recency_multiplier
+```
+
+其中 `relevance_score` 由 `SmartWeightingStrategy` 计算：
+
+```
+relevance_score(msg_i) = keyword_score(msg_i, query)
+                       × pair_coherence_boost(msg_i)
+                       × role_factor(msg_i)
+```
+
+| 因子 | 公式 | 说明 |
+|---|---|---|
+| `keyword_score` | BM25 归一化到 [floor, 1.0] | 消息文本与当前 query 的关键词重叠程度 |
+| `pair_coherence_boost` | `max(kw_score, coherence × prev_user_score)` | assistant 回复继承上一条 user 消息的分数（Q&A 对不被拆散） |
+| `role_factor` | `tool_penalty` if role=tool or tool_calls else 1.0 | 工具调用中间结果降权 |
+
+`recency_multiplier` 由 `RecencyBiasedAlgorithm` 在选择阶段施加：
+
+```
+recency_multiplier = 1 + factor × (position_from_oldest / (n - 1))
+```
+
+最旧消息乘以 1.0，最新消息乘以 `1 + factor`（默认 factor=1.5 → 2.5x）。
+
+### 选择流程图解
+
+```
+所有消息 (n条)
+    │
+    ▼ SmartWeightingStrategy
+    │  ① BM25 关键词打分
+    │  ② pair coherence 提升 assistant 回复
+    │  ③ tool 消息降权 × tool_penalty
+    │
+    ▼ RecencyBiasedAlgorithm
+    │  ④ 近期乘数 (线性递增到 1+factor)
+    │  ⑤ 按 weight 排序 → 贪心填满预算
+    │
+    ▼ ConstraintChecker.repair
+       ⑥ 强制保留最后一条 user 消息
+       ⑦ 解析 dependencies → tool 对永不分离
+       ⑧ 满足 min_chat_messages
+```
+
+### 子智能体分析（LLMContextAnalyzer）
+
+除了关键词相关性，还可以启用 LLM 子智能体对消息重要性做语义分析。
+
+**关键设计：五档分类而非浮点打分。**
+
+LLM 不擅长输出校准的浮点数（0.73 和 0.75 对它来说没有区别），但它非常擅长做分类决策。每条消息被分入五档之一：
+
+| 标签 | 含义 | 映射权重 |
+|---|---|---|
+| **K** Keep | 必须保留：直接回答当前问题 | 1.00 |
+| **H** Helpful | 应该保留：有用的背景信息 | 0.75 |
+| **M** Maybe | 中性：可能有用，预算允许再保留 | 0.50 |
+| **S** Skip | 可跳过：可能不需要，旧内容或偏题 | 0.25 |
+| **D** Drop | 丢弃：与当前问题明显无关 | 0.05 |
+
+LLM 输出格式（极简，节省 token）：
+```json
+{"labels": ["K", "H", "M", "S", "D", ...]}
+```
+
+解析器支持三种容错格式：JSON object → JSON array → 正则提取字母（应对 LLM 不严格遵守格式的情况）。
+
+```python
+from lethes.weighting import CompositeWeightStrategy, SmartWeightingStrategy
+from lethes.weighting.llm_analyzer import LLMContextAnalyzer
+
+weighting = CompositeWeightStrategy([
+    (SmartWeightingStrategy(), 0.4),          # 快速关键词信号（无 API 调用）
+    (LLMContextAnalyzer(                       # 语义分类（五档，结果缓存）
+        api_base="https://api.openai.com/v1",
+        api_key="sk-...",
+        model="gpt-4o-mini",
+        cache=RedisCache.from_url("redis://..."),
+    ), 0.6),
+])
+
+---
+
 ## Flag 控制语法
 
 用户可以在对话消息开头用 `!` 前缀直接控制编排行为：
@@ -124,23 +291,53 @@ orchestrator = ContextOrchestrator(
 
 ### 内置 Flag
 
+#### 截断 / 预算控制
+
 | Flag | 作用 |
 |---|---|
 | `!full` | 关闭所有截断，传递完整上下文 |
+| `!target=N` | 设置本轮 token 目标（尽量接近 N，而非上限） |
 | `!context=N` | 本轮只保留最近 N 轮对话 |
 | `!nosum` | 禁止摘要，超限消息直接丢弃 |
-| `!pin` | 固定当前消息，永不截断或压缩 |
+
+#### 强制保留（锚定）
+
+| Flag | 作用 |
+|---|---|
+| `!pin` | 固定**当前**消息，永不截断或压缩 |
+| `!recent=N` | 强制保留最近 N 条非系统消息（无论权重） |
+| `!keep_tag=标签` | 保留所有带该标签的消息（配合 `!+tag=` 使用） |
+
+#### 权重覆盖
+
+| Flag | 作用 |
+|---|---|
 | `!weight=N` | 设置当前消息的基础权重（默认 1.0） |
-| `!tag=标签名` | 为当前消息添加标签 |
+| `!tool_penalty=F` | 本轮工具调用中间消息的权重乘数（默认 0.5） |
+| `!pair_coherence=F` | 本轮 Q&A 对相干系数（0.0–1.0，默认 0.8） |
+
+#### 消息元数据
+
+| Flag | 作用 |
+|---|---|
+| `!tag=标签名` | 为当前消息添加标签（配合 `!keep_tag=` 使用） |
 
 **示例：**
 
 ```
+# 重要背景，永久固定
 !+pin 这是重要的系统背景，请始终参考。
 
-!context=5,nosum 我想用更紧凑的上下文回答这个问题。
+# 强制保留最近 4 条消息 + 设置紧凑 token 目标
+!recent=4,target=6000 请基于最近对话回答。
 
-!weight=5.0 这个需求非常关键，不要压缩或丢失。
+# 本轮不需要工具调用历史（降低工具权重）
+!tool_penalty=0.1 请总结一下对话，忽略工具调用细节。
+
+# 标记重要消息，之后可按标签保留
+!+tag=key_decision 我们决定使用 PostgreSQL 作为主数据库。
+# ... 若干轮后 ...
+!keep_tag=key_decision 请基于我们之前的架构决策继续。
 ```
 
 ---
