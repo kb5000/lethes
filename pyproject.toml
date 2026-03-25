@@ -6,6 +6,7 @@ build-backend = "hatchling.build"
 name = "lethes"
 version = "0.1.0"
 description = "Constraint-driven LLM context management and message orchestration library"
+readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 keywords = ["llm", "context", "openai", "message-broker", "token-management", "context-window"]
