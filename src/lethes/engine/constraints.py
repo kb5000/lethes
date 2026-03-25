@@ -88,6 +88,13 @@ class ConstraintChecker:
         """
         Promote messages from ``drop → summarize → keep_full`` until all
         constraint violations are resolved.
+
+        In addition to explicit constraints, this method always resolves
+        ``message.dependencies``: if a kept message has a dependency that was
+        dropped, the dependency is promoted to ``keep_full`` (or ``summarize``
+        if it already has a summary).  This ensures tool-call / tool-result
+        pairs are never separated even when using algorithms that do not
+        inherently understand dependencies.
         """
         from ..algorithms.base import SelectionResult
 
@@ -116,6 +123,27 @@ class ConstraintChecker:
                 # Promote the first dropped message (oldest by position)
                 promoted_id = drop.pop(0)
                 keep_full.insert(0, promoted_id)
+
+        # Resolve message.dependencies: ensure that anything kept has its
+        # declared dependencies also kept.  Iterates until stable.
+        dep_map: dict[str, list[str]] = {
+            m.id: m.dependencies for m in conversation.messages
+        }
+        drop_set = set(drop)
+        changed = True
+        while changed:
+            changed = False
+            for msg_id in list(keep_full) + list(summarize):
+                for dep_id in dep_map.get(msg_id, []):
+                    if dep_id in drop_set:
+                        dep_msg = conversation.get_by_id(dep_id)
+                        drop_set.discard(dep_id)
+                        if dep_msg and dep_msg.summary is not None:
+                            summarize.append(dep_id)
+                        else:
+                            keep_full.append(dep_id)
+                        changed = True
+        drop = list(drop_set)
 
         return SelectionResult(
             keep_full=keep_full,

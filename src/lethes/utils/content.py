@@ -5,16 +5,21 @@ from __future__ import annotations
 from typing import Any
 
 
-def get_text_content(content: str | list[dict[str, Any]]) -> str:
+def get_text_content(content: str | list[dict[str, Any]] | None) -> str:
     """
     Return plain text from an OpenAI message ``content`` field.
 
-    Handles both the simple string form and the multimodal list form::
+    Handles all OpenAI content variants:
 
-        [{"type": "text", "text": "hello"}, {"type": "image_url", ...}]
+    * ``None`` — tool-call-only assistant messages; returns ``""``
+    * Plain string — returned as-is
+    * Multimodal list — text blocks are joined; non-text blocks (``image_url``,
+      ``image``, ``audio``, etc.) are silently skipped::
 
-    Non-text blocks are silently skipped.
+          [{"type": "text", "text": "hello"}, {"type": "image_url", ...}]
     """
+    if content is None:
+        return ""
     if isinstance(content, str):
         return content
     parts: list[str] = []

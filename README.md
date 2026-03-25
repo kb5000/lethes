@@ -28,6 +28,8 @@
 - **用户可控** — 在对话中直接用 flag 语法精确控制编排行为
 - **多级摘要** — Turn 级、段落级、对话级三层压缩，而非简单删除
 - **KV 缓存优化** — 追踪历史发送序列，最大化前缀命中，降低 API 成本
+- **工具调用感知** — 完整支持 OpenAI tool calls 格式；自动绑定 assistant/tool 消息对的依赖关系，确保上下文截断后序列仍合法
+- **多模态就绪** — 原生支持 `image_url` 内容块（URL 及 base64 格式），编排时自动提取文本，图像块透明透传
 - **无厂商绑定** — 摘要和嵌入通过标准 OpenAI 兼容接口调用，支持 Ollama、vLLM 等
 
 ---
@@ -62,6 +64,34 @@ result = await orchestrator.process(
 
 ready_messages = result.conversation.to_openai_messages()
 # → 标准 OpenAI 格式，可直接传给任何 LLM
+```
+
+`raw_messages` 可以包含任意 OpenAI 消息格式：
+
+```python
+messages = [
+    # 普通文本
+    {"role": "user", "content": "今天天气怎样？"},
+
+    # 工具调用（assistant → content 为 null）
+    {"role": "assistant", "content": None, "tool_calls": [{
+        "id": "call_abc", "type": "function",
+        "function": {"name": "get_weather", "arguments": '{"city":"Paris"}'}
+    }]},
+
+    # 工具返回结果
+    {"role": "tool", "tool_call_id": "call_abc",
+     "name": "get_weather", "content": "22°C, 多云"},
+
+    # 多模态（图片 + 文字）
+    {"role": "user", "content": [
+        {"type": "text", "text": "这张图里有什么？"},
+        {"type": "image_url", "image_url": {
+            "url": "data:image/png;base64,iVBOR...",
+            "detail": "high"
+        }},
+    ]},
+]
 ```
 
 ### 完整配置
@@ -105,6 +135,52 @@ orchestrator = ContextOrchestrator(
     constraints=ConstraintSet(require_last_user=True),
 )
 ```
+
+---
+
+## 工具调用与多模态
+
+### 工具调用（Tool Calls）
+
+lethes 完整支持 OpenAI tool calls 格式，无需任何额外配置：
+
+```
+用户消息
+  ↓
+assistant (content=null, tool_calls=[{id, type, function}])  ← 自动设为对方的依赖
+  ↓
+tool (tool_call_id=..., content="结果")                       ← 自动设为对方的依赖
+  ↓
+assistant ("根据工具结果，答案是…")
+```
+
+**关键保证：**
+
+| 问题 | lethes 的处理 |
+|---|---|
+| tool result 被保留，但 assistant tool_calls 被截断 | ConstraintChecker 自动将 assistant 提升到 keep |
+| assistant tool_calls 被保留，但 tool result 被截断 | ConstraintChecker 自动将 tool result 提升到 keep |
+| tool 消息有预计算摘要，算法想摘要它 | 拒绝摘要，改为 drop（工具对不可拆分） |
+| 一次调用多个并行工具 | 全部双向绑定，整组保持一致 |
+
+依赖关系在 `Conversation.from_openai_messages` 解析时**自动注入**，无需手工设置。
+
+### 多模态消息（图片）
+
+```python
+# URL 格式
+{"type": "image_url", "image_url": {"url": "https://example.com/img.jpg"}}
+
+# Base64 格式（data URI）
+{"type": "image_url", "image_url": {
+    "url": "data:image/png;base64,iVBOR...",
+    "detail": "high"   # "low" | "high" | "auto"
+}}
+```
+
+- 编排时提取 `type=text` 块做权重计算和摘要
+- 图片块（`image_url`、`image` 等）**原样透传**，不被修改或丢弃
+- 包含图片的消息的词元计数只统计文字部分（图片 token 由 API 自行计算）
 
 ---
 
