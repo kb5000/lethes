@@ -238,24 +238,40 @@ recency_multiplier = 1 + factor × (position_from_oldest / (n - 1))
 
 ### 子智能体分析（LLMContextAnalyzer）
 
-除了关键词相关性，还可以启用 LLM 子智能体对消息重要性做语义分析：
+除了关键词相关性，还可以启用 LLM 子智能体对消息重要性做语义分析。
+
+**关键设计：五档分类而非浮点打分。**
+
+LLM 不擅长输出校准的浮点数（0.73 和 0.75 对它来说没有区别），但它非常擅长做分类决策。每条消息被分入五档之一：
+
+| 标签 | 含义 | 映射权重 |
+|---|---|---|
+| **K** Keep | 必须保留：直接回答当前问题 | 1.00 |
+| **H** Helpful | 应该保留：有用的背景信息 | 0.75 |
+| **M** Maybe | 中性：可能有用，预算允许再保留 | 0.50 |
+| **S** Skip | 可跳过：可能不需要，旧内容或偏题 | 0.25 |
+| **D** Drop | 丢弃：与当前问题明显无关 | 0.05 |
+
+LLM 输出格式（极简，节省 token）：
+```json
+{"labels": ["K", "H", "M", "S", "D", ...]}
+```
+
+解析器支持三种容错格式：JSON object → JSON array → 正则提取字母（应对 LLM 不严格遵守格式的情况）。
 
 ```python
 from lethes.weighting import CompositeWeightStrategy, SmartWeightingStrategy
 from lethes.weighting.llm_analyzer import LLMContextAnalyzer
 
 weighting = CompositeWeightStrategy([
-    (SmartWeightingStrategy(), 0.4),          # 快速关键词信号
-    (LLMContextAnalyzer(                       # 慢速语义信号
+    (SmartWeightingStrategy(), 0.4),          # 快速关键词信号（无 API 调用）
+    (LLMContextAnalyzer(                       # 语义分类（五档，结果缓存）
         api_base="https://api.openai.com/v1",
         api_key="sk-...",
-        model="gpt-4o-mini",                   # 廉价快速模型即可
-        cache=RedisCache.from_url("redis://..."),  # 缓存避免重复调用
+        model="gpt-4o-mini",
+        cache=RedisCache.from_url("redis://..."),
     ), 0.6),
 ])
-```
-
-`LLMContextAnalyzer` 向 LLM 发送对话摘要和当前问题，要求对每条消息打分（0.0–1.0）。结果按 `(model, query, message_texts)` 哈希缓存，相同上下文不会重复调用。
 
 ---
 
