@@ -21,7 +21,7 @@ from ..engine.constraints import ConstraintChecker, ConstraintSet
 from ..engine.planner import ContextPlan
 from ..flags.schema import WellKnownFlag
 from ..flags.session import SessionFlags
-from ..models.budget import Budget, CompositeBudget, TokenBudget
+from ..models.budget import Budget, CompositeBudget, TokenBudget, TokenTargetBudget
 from ..models.conversation import Conversation
 from ..models.message import Message
 from ..utils.tokens import TokenCounter
@@ -134,14 +134,15 @@ class ContextOrchestrator:
         Steps:
 
         1. Flag parsing — strip ``!flags`` from message content
-        2. Budget override — honour ``full``, ``context=N``, ``nosum`` flags
-        3. Token counting — fill ``message.token_count``
-        4. Dynamic weighting — score messages against the current query
-        5. Algorithm selection — produce ``SelectionResult``
-        6. Constraint validation + repair
-        7. Summarisation — compress ``summarize`` messages (async, concurrent)
-        8. Assembly — build the final conversation
-        9. Prefix tracking — record the sent sequence
+        2. Budget override — honour ``full``, ``context=N``, ``target=N``, ``nosum`` flags
+        3. Anchor pinning — honour ``recent=N``, ``keep_tag=label`` flags
+        4. Token counting — fill ``message.token_count``
+        5. Dynamic weighting — score messages (passes flag overrides as context)
+        6. Algorithm selection — produce ``SelectionResult``
+        7. Constraint validation + repair (also resolves dependencies)
+        8. Summarisation — compress ``summarize`` messages (async, concurrent)
+        9. Assembly — build the final conversation
+        10. Prefix tracking — record the sent sequence
         """
         # Step 1: Flag parsing
         session_flags, conversation = SessionFlags.from_conversation(conversation)
@@ -160,7 +161,10 @@ class ContextOrchestrator:
         budget = self._override_budget(effective)
         nosum = WellKnownFlag.NOSUM in session_flags
 
-        # Step 3: Token counting (fills .token_count on each message)
+        # Step 3: Anchor pinning — !recent=N and !keep_tag=label
+        conversation = self._apply_anchor_flags(conversation, effective)
+
+        # Step 4: Token counting (fills .token_count on each message)
         messages_with_counts = self._token_counter.fill_counts(list(conversation.messages))
         conversation = conversation.with_messages(messages_with_counts)
 
@@ -180,15 +184,17 @@ class ContextOrchestrator:
             )
             return self._build_result(conversation, plan, session_flags, model_id)
 
-        # Step 4: Dynamic weighting
+        # Step 5: Dynamic weighting — pass flag overrides in context
+        last_user = conversation.last_user_message()
         query = last_user.get_text_content() if last_user else ""
+        weighting_context = _build_weighting_context(effective)
         scores = await self._weighting.score(
-            list(conversation.messages), query, conversation
+            list(conversation.messages), query, conversation, context=weighting_context
         )
         weighted_messages = apply_scores(list(conversation.messages), scores)
         conversation = conversation.with_messages(weighted_messages)
 
-        # Step 5: Algorithm selection (sync)
+        # Step 6: Algorithm selection (sync)
         if self._prefix_tracker and conversation.session_id:
             await self._prefix_tracker.prepare(conversation.session_id)
 
@@ -199,7 +205,7 @@ class ContextOrchestrator:
             self._token_counter,
         )
 
-        # Step 6: Constraint repair
+        # Step 7: Constraint repair
         violations = self._constraint_checker.validate(
             selection, conversation, self._constraints
         )
@@ -224,13 +230,13 @@ class ContextOrchestrator:
                 done=False,
             )
 
-        # Step 7: Summarisation
+        # Step 8: Summarisation
         if not nosum and self._turn_summarizer and plan.summarize:
             conversation = await self._execute_summarization(
                 conversation, plan, self._turn_summarizer
             )
 
-        # Step 8: Assembly
+        # Step 9: Assembly
         final_conversation = self._assemble(conversation, plan, nosum=nosum)
 
         # Emit done event
@@ -241,7 +247,7 @@ class ContextOrchestrator:
                 done=True,
             )
 
-        # Step 9: Prefix tracking
+        # Step 10: Prefix tracking
         if self._prefix_tracker and conversation.session_id:
             sent_ids = [m.id for m in final_conversation.messages]
             await self._prefix_tracker.record(conversation.session_id, sent_ids)
@@ -255,19 +261,61 @@ class ContextOrchestrator:
         if WellKnownFlag.FULL in flags:
             return TokenBudget(max_tokens=0)  # unlimited
 
+        if WellKnownFlag.TARGET in flags:
+            try:
+                target = int(flags[WellKnownFlag.TARGET])  # type: ignore[arg-type]
+                return TokenTargetBudget(target_tokens=target)
+            except (TypeError, ValueError):
+                logger.warning("Invalid target flag value: %r", flags[WellKnownFlag.TARGET])
+
         if WellKnownFlag.CONTEXT in flags:
             try:
                 max_turns = int(flags[WellKnownFlag.CONTEXT])  # type: ignore[arg-type]
-                # Convert turn limit to an approximate token budget
-                # We use a turn-count-aware sub-budget approach:
-                # Return the budget with a turn_limit annotation in metadata.
-                # The greedy algorithm doesn't know about turns, so we use a
-                # TurnLimitBudget wrapper here.
                 return _TurnLimitBudget(max_turns=max_turns)
             except (TypeError, ValueError):
                 logger.warning("Invalid context flag value: %r", flags[WellKnownFlag.CONTEXT])
 
         return self._budget
+
+    @staticmethod
+    def _apply_anchor_flags(
+        conversation: Conversation, flags: dict
+    ) -> Conversation:
+        """
+        Pin messages based on ``recent=N`` and ``keep_tag=label`` flags.
+
+        * ``recent=N`` — pins the last N non-system messages so the algorithm
+          never drops or summarises them.
+        * ``keep_tag=label`` — pins every message that carries the given tag.
+        """
+        updated = list(conversation.messages)
+        changed = False
+
+        # !keep_tag=label — pin all messages with that tag
+        keep_tag = flags.get(str(WellKnownFlag.KEEP_TAG))
+        if keep_tag:
+            for i, m in enumerate(updated):
+                if keep_tag in m.tags and not m.pinned:
+                    updated[i] = dataclasses.replace(m, pinned=True)
+                    changed = True
+
+        # !recent=N — pin last N chat messages
+        recent_val = flags.get(str(WellKnownFlag.RECENT))
+        if recent_val is not None:
+            try:
+                n_recent = int(recent_val)
+                chat_indices = [
+                    i for i, m in enumerate(updated) if m.role != "system"
+                ]
+                to_pin = set(chat_indices[-n_recent:]) if n_recent > 0 else set()
+                for i in to_pin:
+                    if not updated[i].pinned:
+                        updated[i] = dataclasses.replace(updated[i], pinned=True)
+                        changed = True
+            except (TypeError, ValueError):
+                logger.warning("Invalid recent flag value: %r", recent_val)
+
+        return conversation.with_messages(updated) if changed else conversation
 
     async def _execute_summarization(
         self,
@@ -378,6 +426,30 @@ class ContextOrchestrator:
         )
 
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _build_weighting_context(flags: dict) -> dict[str, Any]:
+    """
+    Extract flag values that weighting strategies can consume via their
+    ``context`` parameter.  Currently passes through:
+
+    * ``tool_penalty`` — overrides :attr:`~lethes.weighting.smart.SmartWeightingStrategy.tool_penalty`
+    * ``pair_coherence`` — overrides :attr:`~lethes.weighting.smart.SmartWeightingStrategy.pair_coherence`
+    """
+    ctx: dict[str, Any] = {}
+    for flag_name, ctx_key in [
+        (WellKnownFlag.TOOL_PENALTY, "tool_penalty"),
+        (WellKnownFlag.PAIR_COHERENCE, "pair_coherence"),
+    ]:
+        val = flags.get(str(flag_name))
+        if val is not None:
+            try:
+                ctx[ctx_key] = float(val)
+            except (TypeError, ValueError):
+                pass
+    return ctx
+
+
 # ── Turn-limit budget (internal) ──────────────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -398,8 +470,6 @@ class _TurnLimitBudget:
     def headroom_tokens(self, current_tokens: int) -> int:
         return -1  # unlimited for the algorithm; turns enforced separately
 
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
 
 async def _emit_status(emitter: EventEmitter, description: str, done: bool) -> None:
     try:

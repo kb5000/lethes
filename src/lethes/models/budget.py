@@ -44,6 +44,35 @@ class TokenBudget:
 
 
 @dataclass(frozen=True)
+class TokenTargetBudget:
+    """
+    Aim for a *specific* token count rather than enforcing a hard maximum.
+
+    Semantically different from :class:`TokenBudget`: the intent is to fill
+    the context window **as close to** ``target_tokens`` as possible, allowing
+    a small ``overshoot`` to avoid stopping just short of the target on a
+    message boundary.
+
+    Use this when you want predictable, consistent context sizes turn-over-turn
+    (e.g. always sending ~8 000 tokens to a model with a 16 k context window).
+
+    Equivalent flag: ``!target=N``
+    """
+
+    target_tokens: int
+    """Desired token count."""
+
+    overshoot: int = 150
+    """Allow going up to ``target_tokens + overshoot`` to avoid message splits."""
+
+    def is_exceeded(self, tokens: int, cost_usd: float = 0.0) -> bool:
+        return tokens > self.target_tokens + self.overshoot
+
+    def headroom_tokens(self, current_tokens: int) -> int:
+        return max(0, self.target_tokens + self.overshoot - current_tokens)
+
+
+@dataclass(frozen=True)
 class CostBudget:
     """Soft limit on estimated API cost per request (USD)."""
 

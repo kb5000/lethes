@@ -184,6 +184,81 @@ assistant ("根据工具结果，答案是…")
 
 ---
 
+## 编排逻辑详解
+
+### 消息重要性评分公式
+
+每条消息的最终权重由三个因子相乘得到：
+
+```
+weight = base_weight × relevance_score × recency_multiplier
+```
+
+其中 `relevance_score` 由 `SmartWeightingStrategy` 计算：
+
+```
+relevance_score(msg_i) = keyword_score(msg_i, query)
+                       × pair_coherence_boost(msg_i)
+                       × role_factor(msg_i)
+```
+
+| 因子 | 公式 | 说明 |
+|---|---|---|
+| `keyword_score` | BM25 归一化到 [floor, 1.0] | 消息文本与当前 query 的关键词重叠程度 |
+| `pair_coherence_boost` | `max(kw_score, coherence × prev_user_score)` | assistant 回复继承上一条 user 消息的分数（Q&A 对不被拆散） |
+| `role_factor` | `tool_penalty` if role=tool or tool_calls else 1.0 | 工具调用中间结果降权 |
+
+`recency_multiplier` 由 `RecencyBiasedAlgorithm` 在选择阶段施加：
+
+```
+recency_multiplier = 1 + factor × (position_from_oldest / (n - 1))
+```
+
+最旧消息乘以 1.0，最新消息乘以 `1 + factor`（默认 factor=1.5 → 2.5x）。
+
+### 选择流程图解
+
+```
+所有消息 (n条)
+    │
+    ▼ SmartWeightingStrategy
+    │  ① BM25 关键词打分
+    │  ② pair coherence 提升 assistant 回复
+    │  ③ tool 消息降权 × tool_penalty
+    │
+    ▼ RecencyBiasedAlgorithm
+    │  ④ 近期乘数 (线性递增到 1+factor)
+    │  ⑤ 按 weight 排序 → 贪心填满预算
+    │
+    ▼ ConstraintChecker.repair
+       ⑥ 强制保留最后一条 user 消息
+       ⑦ 解析 dependencies → tool 对永不分离
+       ⑧ 满足 min_chat_messages
+```
+
+### 子智能体分析（LLMContextAnalyzer）
+
+除了关键词相关性，还可以启用 LLM 子智能体对消息重要性做语义分析：
+
+```python
+from lethes.weighting import CompositeWeightStrategy, SmartWeightingStrategy
+from lethes.weighting.llm_analyzer import LLMContextAnalyzer
+
+weighting = CompositeWeightStrategy([
+    (SmartWeightingStrategy(), 0.4),          # 快速关键词信号
+    (LLMContextAnalyzer(                       # 慢速语义信号
+        api_base="https://api.openai.com/v1",
+        api_key="sk-...",
+        model="gpt-4o-mini",                   # 廉价快速模型即可
+        cache=RedisCache.from_url("redis://..."),  # 缓存避免重复调用
+    ), 0.6),
+])
+```
+
+`LLMContextAnalyzer` 向 LLM 发送对话摘要和当前问题，要求对每条消息打分（0.0–1.0）。结果按 `(model, query, message_texts)` 哈希缓存，相同上下文不会重复调用。
+
+---
+
 ## Flag 控制语法
 
 用户可以在对话消息开头用 `!` 前缀直接控制编排行为：
@@ -200,23 +275,53 @@ assistant ("根据工具结果，答案是…")
 
 ### 内置 Flag
 
+#### 截断 / 预算控制
+
 | Flag | 作用 |
 |---|---|
 | `!full` | 关闭所有截断，传递完整上下文 |
+| `!target=N` | 设置本轮 token 目标（尽量接近 N，而非上限） |
 | `!context=N` | 本轮只保留最近 N 轮对话 |
 | `!nosum` | 禁止摘要，超限消息直接丢弃 |
-| `!pin` | 固定当前消息，永不截断或压缩 |
+
+#### 强制保留（锚定）
+
+| Flag | 作用 |
+|---|---|
+| `!pin` | 固定**当前**消息，永不截断或压缩 |
+| `!recent=N` | 强制保留最近 N 条非系统消息（无论权重） |
+| `!keep_tag=标签` | 保留所有带该标签的消息（配合 `!+tag=` 使用） |
+
+#### 权重覆盖
+
+| Flag | 作用 |
+|---|---|
 | `!weight=N` | 设置当前消息的基础权重（默认 1.0） |
-| `!tag=标签名` | 为当前消息添加标签 |
+| `!tool_penalty=F` | 本轮工具调用中间消息的权重乘数（默认 0.5） |
+| `!pair_coherence=F` | 本轮 Q&A 对相干系数（0.0–1.0，默认 0.8） |
+
+#### 消息元数据
+
+| Flag | 作用 |
+|---|---|
+| `!tag=标签名` | 为当前消息添加标签（配合 `!keep_tag=` 使用） |
 
 **示例：**
 
 ```
+# 重要背景，永久固定
 !+pin 这是重要的系统背景，请始终参考。
 
-!context=5,nosum 我想用更紧凑的上下文回答这个问题。
+# 强制保留最近 4 条消息 + 设置紧凑 token 目标
+!recent=4,target=6000 请基于最近对话回答。
 
-!weight=5.0 这个需求非常关键，不要压缩或丢失。
+# 本轮不需要工具调用历史（降低工具权重）
+!tool_penalty=0.1 请总结一下对话，忽略工具调用细节。
+
+# 标记重要消息，之后可按标签保留
+!+tag=key_decision 我们决定使用 PostgreSQL 作为主数据库。
+# ... 若干轮后 ...
+!keep_tag=key_decision 请基于我们之前的架构决策继续。
 ```
 
 ---
