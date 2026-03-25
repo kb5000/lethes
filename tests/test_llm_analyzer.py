@@ -13,6 +13,7 @@ from lethes.weighting.llm_analyzer import (
     LABEL_WEIGHTS,
     LABELS,
     LLMContextAnalyzer,
+    _extract_keywords,
 )
 
 
@@ -285,3 +286,361 @@ async def test_score_label_k_means_highest_weight(respx_mock):
     assert scores[msgs[2].id] == 1.0        # K
     assert scores[msgs[0].id] == LABEL_WEIGHTS["D"]
     assert scores[msgs[1].id] == LABEL_WEIGHTS["D"]
+
+
+# ── _extract_keywords ─────────────────────────────────────────────────────────
+
+def test_extract_keywords_basic():
+    text = "Python decorators are a powerful feature of Python programming"
+    kws = _extract_keywords(text, top_n=3)
+    assert "python" in kws
+    assert "decorators" in kws
+
+
+def test_extract_keywords_filters_stop_words():
+    text = "the and for are but not you all can"
+    kws = _extract_keywords(text, top_n=5)
+    assert kws == []  # all stop words
+
+
+def test_extract_keywords_top_n_respected():
+    text = "alpha beta gamma delta epsilon zeta eta"
+    kws = _extract_keywords(text, top_n=3)
+    assert len(kws) <= 3
+
+
+# ── _cluster_messages ─────────────────────────────────────────────────────────
+
+def _make_topic_msgs(groups: list[tuple[str, list[str]]]) -> list[Message]:
+    """Build messages grouped by topic. Each group is (role, [contents])."""
+    msgs = []
+    idx = 0
+    for role, contents in groups:
+        for content in contents:
+            msgs.append(Message(role=role, content=content, sequence_index=idx))
+            idx += 1
+    return msgs
+
+
+def test_cluster_single_topic():
+    """All on-topic messages form one cluster."""
+    a = _analyzer()
+    msgs = [
+        Message(role="user", content="Paris weather forecast today", sequence_index=i)
+        for i in range(4)
+    ]
+    clusters = a._cluster_messages(msgs)
+    assert len(clusters) >= 1
+    # All indices present across all clusters
+    all_indices = [i for c in clusters for i in c.indices]
+    assert sorted(all_indices) == list(range(4))
+
+
+def test_cluster_assigns_keywords():
+    a = _analyzer()
+    msgs = [
+        Message(role="user", content="Python decorators usage", sequence_index=0),
+        Message(role="assistant", content="Python decorators wrap functions", sequence_index=1),
+    ]
+    clusters = a._cluster_messages(msgs)
+    assert len(clusters) >= 1
+    assert clusters[0].keywords  # has some keywords
+
+
+def test_cluster_ids_are_sequential():
+    a = _analyzer()
+    msgs = _make_msgs(6)
+    clusters = a._cluster_messages(msgs)
+    for i, c in enumerate(clusters):
+        assert c.topic_id == f"topic_{i}"
+
+
+def test_cluster_empty_window():
+    a = _analyzer()
+    assert a._cluster_messages([]) == []
+
+
+def test_cluster_single_message():
+    a = _analyzer()
+    msgs = [Message(role="user", content="hello", sequence_index=0)]
+    clusters = a._cluster_messages(msgs)
+    assert len(clusters) == 1
+    assert clusters[0].indices == [0]
+
+
+def test_cluster_covers_all_indices():
+    """Every index 0..n-1 must appear in exactly one cluster."""
+    a = _analyzer()
+    msgs = _make_msgs(10)
+    clusters = a._cluster_messages(msgs)
+    all_indices = sorted(i for c in clusters for i in c.indices)
+    assert all_indices == list(range(10))
+    # No duplicates
+    assert len(all_indices) == len(set(all_indices))
+
+
+# ── _build_overview ───────────────────────────────────────────────────────────
+
+def test_build_overview_contains_topic_ids():
+    a = _analyzer()
+    msgs = _make_msgs(4)
+    clusters = a._cluster_messages(msgs)
+    overview = a._build_overview(msgs, "test query", clusters, set())
+    for c in clusters:
+        assert c.topic_id in overview
+
+
+def test_build_overview_contains_current_question():
+    a = _analyzer()
+    msgs = _make_msgs(3)
+    clusters = a._cluster_messages(msgs)
+    overview = a._build_overview(msgs, "what is the answer?", clusters, set())
+    assert "what is the answer?" in overview
+
+
+def test_build_overview_auto_expanded_messages_shown():
+    a = _analyzer()
+    msgs = _make_msgs(4)
+    clusters = a._cluster_messages(msgs)
+    # Mark index 1 as auto-expanded
+    overview = a._build_overview(msgs, "query", clusters, {1})
+    # Index 1 content should appear in expanded section
+    assert "[2]" in overview  # 1-based
+
+
+def test_build_overview_label_count_in_footer():
+    a = _analyzer()
+    msgs = _make_msgs(5)
+    clusters = a._cluster_messages(msgs)
+    overview = a._build_overview(msgs, "q", clusters, set())
+    assert "5 labels" in overview
+
+
+# ── Integration: entry logic with mocked LLM ─────────────────────────────────
+
+
+def _entry_analyzer(**kwargs) -> LLMContextAnalyzer:
+    return LLMContextAnalyzer(
+        api_base="https://api.example.com/v1",
+        api_key="test",
+        use_entry_logic=True,
+        max_expansions=2,
+        **kwargs,
+    )
+
+
+@pytest.mark.asyncio
+async def test_entry_logic_single_shot(respx_mock):
+    """LLM responds directly with labels (no tool calls)."""
+    import httpx
+
+    respx_mock.post("https://api.example.com/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"content": '{"labels": ["K", "H", "M"]}', "tool_calls": None}}
+                ]
+            },
+        )
+    )
+
+    a = _entry_analyzer()
+    msgs = _make_msgs(3)
+    conv = Conversation(msgs)
+    scores = await a.score(msgs, "test query", conv)
+
+    assert scores[msgs[0].id] == LABEL_WEIGHTS["K"]
+    assert scores[msgs[1].id] == LABEL_WEIGHTS["H"]
+    assert scores[msgs[2].id] == LABEL_WEIGHTS["M"]
+
+
+@pytest.mark.asyncio
+async def test_entry_logic_expand_then_classify(respx_mock):
+    """LLM calls expand_topic once, then classifies on second call."""
+    import httpx
+
+    call_count = 0
+
+    def side_effect(request):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            # First call: LLM asks to expand topic_0
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": "tc1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "expand_topic",
+                                            "arguments": '{"topic_id": "topic_0"}',
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                },
+            )
+        else:
+            # Second call: classify after seeing expansion
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {"message": {"content": '{"labels": ["K", "H", "D"]}', "tool_calls": None}}
+                    ]
+                },
+            )
+
+    respx_mock.post("https://api.example.com/v1/chat/completions").mock(side_effect=side_effect)
+
+    a = _entry_analyzer()
+    msgs = _make_msgs(3)
+    conv = Conversation(msgs)
+    scores = await a.score(msgs, "query", conv)
+
+    assert call_count == 2
+    assert scores[msgs[0].id] == LABEL_WEIGHTS["K"]
+    assert scores[msgs[1].id] == LABEL_WEIGHTS["H"]
+    assert scores[msgs[2].id] == LABEL_WEIGHTS["D"]
+
+
+@pytest.mark.asyncio
+async def test_entry_logic_unknown_topic_id_handled(respx_mock):
+    """expand_topic with unknown topic_id returns error message, loop continues."""
+    import httpx
+
+    call_count = 0
+
+    def side_effect(request):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": "tc1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "expand_topic",
+                                            "arguments": '{"topic_id": "nonexistent"}',
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                },
+            )
+        else:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {"message": {"content": '{"labels": ["M", "M", "K"]}', "tool_calls": None}}
+                    ]
+                },
+            )
+
+    respx_mock.post("https://api.example.com/v1/chat/completions").mock(side_effect=side_effect)
+
+    a = _entry_analyzer()
+    msgs = _make_msgs(3)
+    conv = Conversation(msgs)
+    scores = await a.score(msgs, "query", conv)
+
+    assert call_count == 2
+    assert scores[msgs[2].id] == LABEL_WEIGHTS["K"]
+
+
+@pytest.mark.asyncio
+async def test_entry_logic_respects_max_expansions(respx_mock):
+    """After max_expansions tool calls, the loop sends a final no-tool request."""
+    import httpx
+
+    call_count = 0
+
+    def side_effect(request):
+        nonlocal call_count
+        call_count += 1
+        body = json.loads(request.content)
+        # If no tools offered, return labels; otherwise keep calling tool
+        if "tools" not in body:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {"message": {"content": '{"labels": ["K", "M", "D"]}', "tool_calls": None}}
+                    ]
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": f"tc{call_count}",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "expand_topic",
+                                        "arguments": '{"topic_id": "topic_0"}',
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ]
+            },
+        )
+
+    respx_mock.post("https://api.example.com/v1/chat/completions").mock(side_effect=side_effect)
+
+    # max_expansions=2 is already set in _entry_analyzer default
+    a = _entry_analyzer()
+    msgs = _make_msgs(3)
+    conv = Conversation(msgs)
+    scores = await a.score(msgs, "query", conv)
+
+    # max_expansions=2 means iterations 0,1 offer tools; iteration 2 does not
+    assert call_count == 3
+    assert scores[msgs[0].id] == LABEL_WEIGHTS["K"]
+
+
+@pytest.mark.asyncio
+async def test_entry_logic_falls_back_on_failure(respx_mock):
+    """LLM failure during entry logic → default weights."""
+    import httpx
+
+    respx_mock.post("https://api.example.com/v1/chat/completions").mock(
+        return_value=httpx.Response(500, text="Server error")
+    )
+
+    a = _entry_analyzer()
+    msgs = _make_msgs(3)
+    conv = Conversation(msgs)
+    scores = await a.score(msgs, "query", conv)
+
+    default_w = LABEL_WEIGHTS[DEFAULT_LABEL]
+    for m in msgs:
+        assert scores[m.id] == default_w
