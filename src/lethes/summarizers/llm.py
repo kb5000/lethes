@@ -11,15 +11,17 @@ Ported and generalised from ``example.py``'s ``llm_comp_text()`` and
 from __future__ import annotations
 
 import asyncio
-import logging
+import time
 from typing import TYPE_CHECKING, Any
 
 import httpx
 
+from ..observability import get_logger
+
 if TYPE_CHECKING:
     from ..models.message import Message
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _DEFAULT_SYSTEM_PROMPT = (
     "You are a context compression assistant. "
@@ -98,21 +100,29 @@ class LLMSummarizer:
         system = self._system_prompt.format(target_pct=target_pct)
         user = self._user_prompt.format(context=context_str, message=message_str)
 
+        log = logger.bind(model=self._model, n_messages=len(messages))
         for attempt in range(self._retry_attempts):
+            t0 = time.perf_counter()
             try:
                 result = await self._call_api(system, user)
+                log.debug("summarizer.done",
+                    attempt=attempt + 1,
+                    input_chars=len(message_str),
+                    output_chars=len(result),
+                    elapsed_ms=round((time.perf_counter() - t0) * 1000, 1),
+                )
                 return result
             except Exception as exc:
-                logger.warning(
-                    "Summary attempt %d/%d failed: %s",
-                    attempt + 1,
-                    self._retry_attempts,
-                    exc,
+                log.warning("summarizer.attempt_failed",
+                    attempt=attempt + 1,
+                    max_attempts=self._retry_attempts,
+                    error=str(exc),
+                    elapsed_ms=round((time.perf_counter() - t0) * 1000, 1),
                 )
                 if attempt < self._retry_attempts - 1:
                     await asyncio.sleep(1)
 
-        logger.error("All summary attempts failed; returning placeholder")
+        log.error("summarizer.all_failed", attempts=self._retry_attempts)
         return "-"
 
     def name(self) -> str:

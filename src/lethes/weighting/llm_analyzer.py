@@ -56,12 +56,13 @@ from __future__ import annotations
 
 import dataclasses
 import json
-import logging
 import re
+import time
 from typing import TYPE_CHECKING, Any
 
 import httpx
 
+from ..observability import get_logger
 from ..utils.ids import cache_key_for_strings
 
 if TYPE_CHECKING:
@@ -69,7 +70,7 @@ if TYPE_CHECKING:
     from ..models.conversation import Conversation
     from ..models.message import Message
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _CACHE_PREFIX = "lethes:llm_label:"
 
@@ -293,6 +294,7 @@ class LLMContextAnalyzer:
             *[self._format_snippet(m) for m in window],
         )
         labels: list[str] | None = None
+        cache_hit = False
         if self._cache:
             cached = await self._cache.get(cache_key)
             if cached:
@@ -300,16 +302,37 @@ class LLMContextAnalyzer:
                     labels = json.loads(cached)
                     if not isinstance(labels, list):
                         labels = None
+                    else:
+                        cache_hit = True
                 except Exception:
                     pass
 
         if labels is None:
+            t0 = time.perf_counter()
             if self._use_entry_logic:
                 labels = await self._call_llm_with_entry(window, query)
             else:
                 labels = await self._call_llm(window, query)
-            if labels is not None and self._cache:
-                await self._cache.set(cache_key, json.dumps(labels), ttl=1800)
+            elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
+            if labels is not None:
+                label_dist = {k: labels.count(k) for k in ("K", "H", "M", "S", "D") if labels.count(k)}
+                logger.debug("llm_analyzer.done",
+                    model=self._model,
+                    n_messages=len(window),
+                    label_dist=label_dist,
+                    elapsed_ms=elapsed_ms,
+                    entry_logic=self._use_entry_logic,
+                )
+                if self._cache:
+                    await self._cache.set(cache_key, json.dumps(labels), ttl=1800)
+            else:
+                logger.warning("llm_analyzer.failed",
+                    model=self._model,
+                    n_messages=len(window),
+                    elapsed_ms=elapsed_ms,
+                )
+        else:
+            logger.debug("llm_analyzer.cache_hit", model=self._model, n_messages=len(window))
 
         return self._build_result(
             messages, window, labels, out_of_window_ids, system_ids
@@ -373,7 +396,7 @@ class LLMContextAnalyzer:
             raw = resp.json()["choices"][0]["message"]["content"]
             return self._parse_labels(raw, expected_length=len(window))
         except Exception as exc:
-            logger.warning("LLMContextAnalyzer call failed: %s", exc)
+            logger.warning("llm_analyzer.call_failed", model=self._model, error=str(exc))
             return None
 
     # ── Entry logic ────────────────────────────────────────────────────────
@@ -577,8 +600,8 @@ class LLMContextAnalyzer:
                 return self._parse_labels(raw, expected_length=len(window))
 
             except Exception as exc:
-                logger.warning(
-                    "LLMContextAnalyzer entry call failed (iter %d): %s", iteration, exc
+                logger.warning("llm_analyzer.entry_call_failed",
+                    model=self._model, iteration=iteration, error=str(exc),
                 )
                 return None
 
@@ -639,10 +662,10 @@ class LLMContextAnalyzer:
         # Fallback: extract any K/H/M/S/D letters from the raw text
         extracted = re.findall(r"\b([KHMSD])\b", raw.upper())
         if extracted:
-            logger.debug("LLMContextAnalyzer: used regex fallback on %r", raw[:80])
+            logger.debug("llm_analyzer.parse_fallback", raw_preview=raw[:80])
             return self._fit_labels(extracted, expected_length)
 
-        logger.debug("LLMContextAnalyzer: could not parse response: %r", raw[:120])
+        logger.debug("llm_analyzer.parse_failed", raw_preview=raw[:120])
         return None
 
     @staticmethod

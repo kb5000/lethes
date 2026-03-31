@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-import logging
+import time
+import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Awaitable
 
@@ -24,6 +25,7 @@ from ..flags.session import SessionFlags
 from ..models.budget import Budget, CompositeBudget, TokenBudget, TokenTargetBudget
 from ..models.conversation import Conversation
 from ..models.message import Message
+from ..observability import get_logger
 from ..utils.tokens import TokenCounter
 from ..weighting.base import apply_scores
 from ..weighting.static import StaticWeightStrategy
@@ -37,7 +39,7 @@ if TYPE_CHECKING:
     from ..summarizers.levels import TurnSummarizer
     from ..weighting.base import WeightingStrategy
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Type alias for Open WebUI / generic event emitter
 EventEmitter = Callable[[dict[str, Any]], Awaitable[None]]
@@ -144,6 +146,15 @@ class ContextOrchestrator:
         9. Assembly — build the final conversation
         10. Prefix tracking — record the sent sequence
         """
+        t0 = time.perf_counter()
+        log = logger.bind(
+            run_id=str(uuid.uuid4()),
+            model_id=model_id,
+            session_id=str(conversation.session_id) if conversation.session_id else None,
+            n_input=len(conversation.messages),
+        )
+        log.info("pipeline.start")
+
         # Step 1: Flag parsing
         session_flags, conversation = SessionFlags.from_conversation(conversation)
 
@@ -155,7 +166,7 @@ class ContextOrchestrator:
                 conversation = conversation.replace(updated)
 
         effective = session_flags.effective_flags()
-        logger.debug("Effective flags: %s", effective)
+        log.debug("pipeline.flags", flags=[str(k) for k in effective.keys()])
 
         # Step 2: Budget override from flags
         budget = self._override_budget(effective)
@@ -169,6 +180,10 @@ class ContextOrchestrator:
         conversation = conversation.with_messages(messages_with_counts)
 
         pre_plan_tokens = sum(m.token_count or 0 for m in conversation.messages)
+        log.debug("pipeline.tokens", pre_plan_tokens=pre_plan_tokens, n_messages=len(conversation.messages))
+        log.debug("pipeline.messages_in",
+            messages=[_msg_summary(m) for m in conversation.messages],
+        )
 
         # Check if budget is unlimited — skip selection
         if isinstance(budget, TokenBudget) and budget.max_tokens == 0:
@@ -182,6 +197,14 @@ class ContextOrchestrator:
                 pre_plan_tokens=pre_plan_tokens,
                 post_plan_tokens=pre_plan_tokens,
             )
+            log.info("pipeline.complete",
+                mode="full_bypass",
+                output_tokens=pre_plan_tokens,
+                elapsed_ms=round((time.perf_counter() - t0) * 1000, 1),
+                kept=len(conversation.messages),
+                dropped=0,
+                summarized=0,
+            )
             return self._build_result(conversation, plan, session_flags, model_id)
 
         # Step 5: Dynamic weighting — pass flag overrides in context
@@ -193,6 +216,15 @@ class ContextOrchestrator:
         )
         weighted_messages = apply_scores(list(conversation.messages), scores)
         conversation = conversation.with_messages(weighted_messages)
+        if scores:
+            vals = list(scores.values())
+            log.debug("pipeline.weights",
+                strategy=self._weighting.name(),
+                n_scored=len(scores),
+                weight_min=round(min(vals), 3),
+                weight_max=round(max(vals), 3),
+                weight_mean=round(sum(vals) / len(vals), 3),
+            )
 
         # Step 6: Algorithm selection (sync)
         if self._prefix_tracker and conversation.session_id:
@@ -204,13 +236,20 @@ class ContextOrchestrator:
             self._constraints,
             self._token_counter,
         )
+        log.info("pipeline.selection",
+            algorithm=self._algorithm.name(),
+            keep=len(selection.keep_full),
+            summarize=len(selection.summarize),
+            drop=len(selection.drop),
+            estimated_tokens=selection.estimated_tokens,
+        )
 
         # Step 7: Constraint repair
         violations = self._constraint_checker.validate(
             selection, conversation, self._constraints
         )
         if violations:
-            logger.debug("Repairing %d constraint violations", len(violations))
+            log.warning("pipeline.constraint_repair", violations=len(violations))
             selection = self._constraint_checker.repair(
                 selection, conversation, self._constraints
             )
@@ -222,6 +261,18 @@ class ContextOrchestrator:
             pre_plan_tokens=pre_plan_tokens,
         )
 
+        msg_plan: list[dict[str, Any]] = []
+        for _m in conversation.messages:
+            _info = _msg_summary(_m)
+            if _m.id in plan.summarize:
+                _info["disposition"] = "summarized"
+            elif _m.id in plan.drop:
+                _info["disposition"] = "dropped"
+            else:
+                _info["disposition"] = "kept"
+            msg_plan.append(_info)
+        log.debug("pipeline.messages_plan", messages=msg_plan)
+
         # Emit status event
         if event_emitter and plan.total_dropped > 0:
             await _emit_status(
@@ -232,6 +283,7 @@ class ContextOrchestrator:
 
         # Step 8: Summarisation
         if not nosum and self._turn_summarizer and plan.summarize:
+            log.debug("pipeline.summarize_start", n_messages=len(plan.summarize))
             conversation = await self._execute_summarization(
                 conversation, plan, self._turn_summarizer
             )
@@ -252,7 +304,16 @@ class ContextOrchestrator:
             sent_ids = [m.id for m in final_conversation.messages]
             await self._prefix_tracker.record(conversation.session_id, sent_ids)
 
-        return self._build_result(final_conversation, plan, session_flags, model_id)
+        result = self._build_result(final_conversation, plan, session_flags, model_id)
+        log.info("pipeline.complete",
+            output_tokens=result.token_count,
+            cost_usd=result.estimated_cost_usd,
+            elapsed_ms=round((time.perf_counter() - t0) * 1000, 1),
+            kept=plan.total_kept,
+            dropped=plan.total_dropped,
+            summarized=len(plan.summarize),
+        )
+        return result
 
     # ── Internal steps ────────────────────────────────────────────────────
 
@@ -266,14 +327,14 @@ class ContextOrchestrator:
                 target = int(flags[WellKnownFlag.TARGET])  # type: ignore[arg-type]
                 return TokenTargetBudget(target_tokens=target)
             except (TypeError, ValueError):
-                logger.warning("Invalid target flag value: %r", flags[WellKnownFlag.TARGET])
+                logger.warning("invalid_flag_value", flag="target", value=flags[WellKnownFlag.TARGET])
 
         if WellKnownFlag.CONTEXT in flags:
             try:
                 max_turns = int(flags[WellKnownFlag.CONTEXT])  # type: ignore[arg-type]
                 return _TurnLimitBudget(max_turns=max_turns)
             except (TypeError, ValueError):
-                logger.warning("Invalid context flag value: %r", flags[WellKnownFlag.CONTEXT])
+                logger.warning("invalid_flag_value", flag="context", value=flags[WellKnownFlag.CONTEXT])
 
         return self._budget
 
@@ -313,7 +374,7 @@ class ContextOrchestrator:
                         updated[i] = dataclasses.replace(updated[i], pinned=True)
                         changed = True
             except (TypeError, ValueError):
-                logger.warning("Invalid recent flag value: %r", recent_val)
+                logger.warning("invalid_flag_value", flag="recent", value=recent_val)
 
         return conversation.with_messages(updated) if changed else conversation
 
@@ -427,6 +488,25 @@ class ContextOrchestrator:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _msg_summary(m: Message, preview_len: int = 180) -> dict[str, Any]:
+    """Compact message descriptor for observability log events."""
+    text = m.get_text_content()
+    preview = text[:preview_len] + ("…" if len(text) > preview_len else "")
+    d: dict[str, Any] = {
+        "id": m.id,
+        "role": m.role,
+        "tokens": m.token_count or 0,
+        "preview": preview,
+    }
+    if m.pinned:
+        d["pinned"] = True
+    if m.tool_calls:
+        d["tool_calls"] = [
+            tc.get("function", {}).get("name", "?") for tc in m.tool_calls
+        ]
+    return d
+
 
 def _build_weighting_context(flags: dict) -> dict[str, Any]:
     """

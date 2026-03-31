@@ -4,9 +4,20 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+
+def _normalize(s: str) -> str:
+    """Lowercase and strip all non-alphanumeric chars, keeping ``*`` for glob patterns."""
+    return re.sub(r"[^a-z0-9*]", "", s.lower())
+
+if TYPE_CHECKING:
+    import httpx
+
+_OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 
 
 @dataclass(frozen=True)
@@ -63,17 +74,128 @@ class ModelPricingTable:
             return cls.from_json(default_path)
         return cls([])
 
+    @classmethod
+    def from_openrouter(
+        cls,
+        *,
+        strip_provider_prefix: bool = True,
+        timeout: float = 10.0,
+    ) -> "ModelPricingTable":
+        """Fetch live pricing from the OpenRouter ``/api/v1/models`` endpoint (sync).
+
+        OpenRouter returns prices as USD *per token*; they are converted to the
+        per-1 M token unit used internally.
+
+        Parameters
+        ----------
+        strip_provider_prefix:
+            When ``True`` (default) the ``provider/`` prefix is removed so that
+            e.g. ``"openai/gpt-4o"`` is stored as ``"gpt-4o"``, matching the
+            same way callers normally pass model IDs to OpenAI/Anthropic SDKs.
+            Set to ``False`` to keep the full ``"provider/model"`` form.
+        timeout:
+            HTTP request timeout in seconds.
+
+        Raises
+        ------
+        httpx.HTTPError
+            On network or HTTP-level failures.  Callers that want a silent
+            fallback can catch this and use :meth:`default` instead.
+        """
+        import httpx
+
+        with httpx.Client(timeout=timeout) as client:
+            resp = client.get(_OPENROUTER_MODELS_URL)
+            resp.raise_for_status()
+            data: dict[str, Any] = resp.json()
+
+        return cls._parse_openrouter_response(data, strip_provider_prefix=strip_provider_prefix)
+
+    @classmethod
+    async def from_openrouter_async(
+        cls,
+        *,
+        strip_provider_prefix: bool = True,
+        timeout: float = 10.0,
+    ) -> "ModelPricingTable":
+        """Async version of :meth:`from_openrouter`."""
+        import httpx
+
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.get(_OPENROUTER_MODELS_URL)
+            resp.raise_for_status()
+            data: dict[str, Any] = resp.json()
+
+        return cls._parse_openrouter_response(data, strip_provider_prefix=strip_provider_prefix)
+
+    @classmethod
+    def _parse_openrouter_response(
+        cls,
+        data: dict[str, Any],
+        *,
+        strip_provider_prefix: bool,
+    ) -> "ModelPricingTable":
+        entries: list[ModelPricingEntry] = []
+        for model in data.get("data", []):
+            pricing = model.get("pricing") or {}
+            prompt_str = pricing.get("prompt")
+            completion_str = pricing.get("completion")
+            if not prompt_str or not completion_str:
+                continue
+
+            try:
+                # OpenRouter prices are USD per token; convert to USD per 1 M
+                input_price = float(prompt_str) * 1_000_000
+                output_price = float(completion_str) * 1_000_000
+            except (ValueError, TypeError):
+                continue
+
+            cache_read_str = pricing.get("input_cache_read")
+            try:
+                cached_price = (
+                    float(cache_read_str) * 1_000_000
+                    if cache_read_str
+                    else input_price * 0.1
+                )
+            except (ValueError, TypeError):
+                cached_price = input_price * 0.1
+
+            raw_id: str = model.get("id", "")
+            if not raw_id:
+                continue
+            model_id = (
+                raw_id.split("/", 1)[1] if strip_provider_prefix and "/" in raw_id else raw_id
+            )
+
+            entries.append(
+                ModelPricingEntry(
+                    model_id=model_id,
+                    input_price_per_1m=input_price,
+                    cached_price_per_1m=cached_price,
+                    output_price_per_1m=output_price,
+                )
+            )
+        return cls(entries)
+
     # ── Lookup ────────────────────────────────────────────────────────────
 
     def get(self, model_id: str) -> ModelPricingEntry | None:
-        """Exact match first, then glob, then ``None``."""
-        # Exact
+        """Exact match → glob → normalized exact → normalized glob → ``None``."""
+        # 1. Exact
         for entry in self._entries:
             if entry.model_id == model_id:
                 return entry
-        # Glob
+        # 2. Glob
         for entry in self._entries:
             if fnmatch.fnmatch(model_id, entry.model_id):
+                return entry
+        # 3 & 4. Normalize both sides (lowercase, strip symbols, keep * for globs)
+        norm = _normalize(model_id)
+        for entry in self._entries:
+            if _normalize(entry.model_id) == norm:
+                return entry
+        for entry in self._entries:
+            if fnmatch.fnmatch(norm, _normalize(entry.model_id)):
                 return entry
         return None
 

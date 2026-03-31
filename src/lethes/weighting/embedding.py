@@ -11,12 +11,13 @@ requests against unchanged history avoid re-embedding.
 from __future__ import annotations
 
 import json
-import logging
 import math
+import time
 from typing import TYPE_CHECKING, Any
 
 import httpx
 
+from ..observability import get_logger
 from ..utils.ids import cache_key_for_strings
 
 if TYPE_CHECKING:
@@ -24,7 +25,7 @@ if TYPE_CHECKING:
     from ..models.conversation import Conversation
     from ..models.message import Message
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _CACHE_PREFIX = "lethes:embed:"
 
@@ -176,13 +177,14 @@ class EmbeddingSimilarityStrategy:
                     key = _CACHE_PREFIX + cache_key_for_strings(self._model, texts[idx])
                     await self._cache.set(key, json.dumps(vec), ttl=3600)
         except Exception as exc:
-            logger.warning("Batch embedding failed (%s), falling back to individual", exc)
+            logger.warning("embedding.batch_fallback", error=str(exc), n_texts=len(batch_texts))
             for idx in uncached_indices:
                 results[idx] = await self._embed_single(texts[idx])
 
         return results
 
     async def _embed_single(self, text: str) -> list[float] | None:
+        t0 = time.perf_counter()
         try:
             resp = await self._client.post(
                 f"{self._api_base}/embeddings",
@@ -191,12 +193,22 @@ class EmbeddingSimilarityStrategy:
             )
             resp.raise_for_status()
             data = resp.json()
+            logger.debug("embedding.api_call",
+                model=self._model,
+                n_texts=1,
+                elapsed_ms=round((time.perf_counter() - t0) * 1000, 1),
+            )
             return data["data"][0]["embedding"]
         except Exception as exc:
-            logger.warning("Embedding request failed: %s", exc)
+            logger.warning("embedding.api_error",
+                model=self._model,
+                error=str(exc),
+                elapsed_ms=round((time.perf_counter() - t0) * 1000, 1),
+            )
             return None
 
     async def _embed_batch(self, texts: list[str]) -> list[list[float] | None]:
+        t0 = time.perf_counter()
         resp = await self._client.post(
             f"{self._api_base}/embeddings",
             headers={"Authorization": f"Bearer {self._api_key}"},
@@ -204,6 +216,11 @@ class EmbeddingSimilarityStrategy:
         )
         resp.raise_for_status()
         data = resp.json()
+        logger.debug("embedding.api_call",
+            model=self._model,
+            n_texts=len(texts),
+            elapsed_ms=round((time.perf_counter() - t0) * 1000, 1),
+        )
         items = sorted(data["data"], key=lambda x: x["index"])
         return [item["embedding"] for item in items]
 

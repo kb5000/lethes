@@ -25,12 +25,15 @@ Open WebUI integration::
 
 from .engine.constraints import ConstraintViolation
 from .engine.orchestrator import ContextOrchestrator, OrchestratorResult
+from .observability import configure_logging
 from .models.budget import Budget, CompositeBudget, CostBudget, TokenBudget, TokenTargetBudget
 from .models.conversation import Conversation
 from .models.message import Message
 from .models.pricing import ModelPricingEntry, ModelPricingTable
 
 __all__ = [
+    # Observability
+    "configure_logging",
     # Core
     "ContextOrchestrator",
     "Conversation",
