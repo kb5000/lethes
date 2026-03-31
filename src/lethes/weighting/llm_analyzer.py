@@ -322,6 +322,7 @@ class LLMContextAnalyzer:
                     label_dist=label_dist,
                     elapsed_ms=elapsed_ms,
                     entry_logic=self._use_entry_logic,
+                    message_labels={m.id: label for m, label in zip(window, labels)},
                 )
                 if self._cache:
                     await self._cache.set(cache_key, json.dumps(labels), ttl=1800)

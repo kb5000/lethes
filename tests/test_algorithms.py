@@ -42,12 +42,26 @@ def test_greedy_keeps_all_within_budget():
 
 
 def test_greedy_drops_low_weight_on_overflow():
-    # One very long message, one short one with higher weight
+    # One very long message, one short one with higher weight.
+    # Without a pre-computed summary, the overflow message goes to summarize
+    # (so TurnSummarizer can generate one) rather than straight to drop.
     long_msg = Message(role="user", content="word " * 500, weight=0.1, sequence_index=0)
     short_msg = Message(role="assistant", content="hi", weight=10.0, sequence_index=1)
     conv = Conversation([long_msg, short_msg])
     budget = TokenBudget(max_tokens=50)
     algo = GreedyByWeightAlgorithm()
+    result = algo.select(conv, budget, _constraints(), _counter())
+    assert short_msg.id in result.keep_full
+    assert long_msg.id in result.summarize
+    assert long_msg.id not in result.drop
+
+
+def test_greedy_drops_on_overflow_when_summarize_disabled():
+    long_msg = Message(role="user", content="word " * 500, weight=0.1, sequence_index=0)
+    short_msg = Message(role="assistant", content="hi", weight=10.0, sequence_index=1)
+    conv = Conversation([long_msg, short_msg])
+    budget = TokenBudget(max_tokens=50)
+    algo = GreedyByWeightAlgorithm(prefer_summarize=False)
     result = algo.select(conv, budget, _constraints(), _counter())
     assert short_msg.id in result.keep_full
     assert long_msg.id in result.drop

@@ -1,55 +1,57 @@
 # lethes
 
-**约束驱动的 LLM 上下文管理库** — 一个把对话历史当作优化问题来处理的消息编排引擎。
+**Constraint-driven LLM context management library** — a message orchestration engine that treats conversation history as an optimization problem.
 
-> *lethes* 取自希腊神话中的遗忘之河。它负责决定什么该被记住、什么该被压缩、什么该被遗忘。
+> *lethes* is named after the river of oblivion in Greek mythology. It decides what must be remembered, what can be compressed, and what should be forgotten.
 
 ---
 
-## 核心理念
+## Core Idea
 
-传统的上下文管理方案只是简单的滑动窗口——超出限制就从头截断。`lethes` 的思路完全不同：
+Traditional context management is a sliding window — truncate from the front when you run out of space. lethes takes a fundamentally different approach:
 
-| 传统方案 | lethes |
+| Traditional | lethes |
 |---|---|
-| 能放多少放多少 | 在约束下求最优解 |
-| 消息地位平等 | 每条消息都有动态权重 |
-| 截断 = 删除 | 截断 = 选择性压缩或删除 |
-| 固定策略 | 算法可插拔 |
-| 无用户控制 | 对话内 flag 精确控制 |
+| Fit as many messages as possible | Optimize under constraints |
+| All messages are equal | Every message has a dynamic weight |
+| Truncation = deletion | Truncation = selective compression or drop |
+| Fixed strategy | Pluggable algorithms |
+| No user control | In-conversation flag syntax |
 
 ---
 
-## 特性
+## Features
 
-- **动态权重** — 消息权重不是固定数字，而是根据当前输入和主题实时计算的相关性评分
-- **约束驱动** — 以词元预算、费用预算为约束，最大化上下文信息量
-- **算法可插拔** — 贪心、近期偏置、依赖感知、前缀缓存优化，或自定义
-- **用户可控** — 在对话中直接用 flag 语法精确控制编排行为
-- **多级摘要** — Turn 级、段落级、对话级三层压缩，而非简单删除
-- **KV 缓存优化** — 追踪历史发送序列，最大化前缀命中，降低 API 成本
-- **工具调用感知** — 完整支持 OpenAI tool calls 格式；自动绑定 assistant/tool 消息对的依赖关系，确保上下文截断后序列仍合法
-- **多模态就绪** — 原生支持 `image_url` 内容块（URL 及 base64 格式），编排时自动提取文本，图像块透明透传
-- **无厂商绑定** — 摘要和嵌入通过标准 OpenAI 兼容接口调用，支持 Ollama、vLLM 等
+- **Dynamic weighting** — message weights are real-time relevance scores against the current query, not fixed numbers
+- **Constraint-driven** — maximize context information subject to token-budget and cost-budget constraints
+- **Pluggable algorithms** — greedy, recency-biased, dependency-aware, prefix-cache-optimized, or bring your own
+- **User-controllable** — a `!flag` syntax lets users adjust orchestration behaviour inline within the conversation
+- **Multi-level summarization** — turn-level, segment-level, and conversation-level compression instead of blunt deletion
+- **KV-cache optimization** — tracks previously sent sequences to maximize prefix hits and lower API cost
+- **Tool-call aware** — full OpenAI tool calls support; automatically binds assistant/tool message pairs so truncation never produces an invalid sequence
+- **Multimodal-ready** — native `image_url` content blocks (URL and base64); text is extracted for scoring, image blocks are passed through untouched
+- **Vendor-agnostic** — summarization and embedding use any OpenAI-compatible endpoint (Ollama, vLLM, OpenRouter, …)
+- **Structured observability** — structlog-based JSON events; plug in [lethes-observer](../lethes_observer) for a real-time web dashboard
 
 ---
 
-## 安装
+## Installation
 
 ```bash
-pip install lethes                  # 基础安装
-pip install lethes[redis]           # 启用 Redis 缓存
-pip install lethes[bm25]            # 启用 BM25 关键词相关性
-pip install lethes[all]             # 安装所有可选依赖
+pip install lethes                  # core
+pip install lethes[redis]           # enable Redis cache
+pip install lethes[bm25]            # enable BM25 keyword relevance
+pip install lethes[langchain]       # LangChain adapter
+pip install lethes[all]             # all optional dependencies
 ```
 
-**最低要求：** Python 3.11+，tiktoken，pydantic，httpx
+**Requirements:** Python 3.11+, tiktoken, pydantic ≥ 2, pydantic-settings ≥ 2, httpx ≥ 0.27, structlog ≥ 24
 
 ---
 
-## 快速上手
+## Quick Start
 
-### 最简用法
+### Minimal usage
 
 ```python
 from lethes import ContextOrchestrator, Conversation, TokenBudget
@@ -63,29 +65,29 @@ result = await orchestrator.process(
 )
 
 ready_messages = result.conversation.to_openai_messages()
-# → 标准 OpenAI 格式，可直接传给任何 LLM
+# → standard OpenAI format, ready for any LLM
 ```
 
-`raw_messages` 可以包含任意 OpenAI 消息格式：
+`raw_messages` accepts any OpenAI message format:
 
 ```python
 messages = [
-    # 普通文本
-    {"role": "user", "content": "今天天气怎样？"},
+    # Plain text
+    {"role": "user", "content": "What's the weather today?"},
 
-    # 工具调用（assistant → content 为 null）
+    # Tool call (assistant content is null)
     {"role": "assistant", "content": None, "tool_calls": [{
         "id": "call_abc", "type": "function",
         "function": {"name": "get_weather", "arguments": '{"city":"Paris"}'}
     }]},
 
-    # 工具返回结果
+    # Tool result
     {"role": "tool", "tool_call_id": "call_abc",
-     "name": "get_weather", "content": "22°C, 多云"},
+     "name": "get_weather", "content": "22°C, partly cloudy"},
 
-    # 多模态（图片 + 文字）
+    # Multimodal (image + text)
     {"role": "user", "content": [
-        {"type": "text", "text": "这张图里有什么？"},
+        {"type": "text", "text": "What's in this image?"},
         {"type": "image_url", "image_url": {
             "url": "data:image/png;base64,iVBOR...",
             "detail": "high"
@@ -94,17 +96,18 @@ messages = [
 ]
 ```
 
-### 完整配置
+### Full configuration
 
 ```python
 from lethes import ContextOrchestrator, Conversation, TokenBudget
 from lethes.algorithms import RecencyBiasedAlgorithm, DependencyAwareAlgorithm
-from lethes.weighting import CompositeWeightStrategy, KeywordRelevanceStrategy, EmbeddingSimilarityStrategy
+from lethes.weighting import CompositeWeightStrategy, SmartWeightingStrategy
+from lethes.weighting.embedding import EmbeddingSimilarityStrategy
 from lethes.summarizers import LLMSummarizer, TurnSummarizer
 from lethes.cache import RedisCache
 from lethes.engine import ConstraintSet
 
-# 动态权重：70% 嵌入相似度 + 30% 关键词匹配
+# Weighting: 70% embedding similarity + 30% smart keyword/coherence
 weighting = CompositeWeightStrategy([
     (EmbeddingSimilarityStrategy(
         api_base="https://api.openai.com/v1",
@@ -112,10 +115,10 @@ weighting = CompositeWeightStrategy([
         model="text-embedding-3-small",
         cache=RedisCache.from_url("redis://localhost:6379/0"),
     ), 0.7),
-    (KeywordRelevanceStrategy(), 0.3),
+    (SmartWeightingStrategy(), 0.3),
 ])
 
-# 摘要后端：任意 OpenAI 兼容接口
+# Summarizer: any OpenAI-compatible endpoint
 summarizer = TurnSummarizer(
     backend=LLMSummarizer(
         api_base="https://api.openai.com/v1",
@@ -138,63 +141,63 @@ orchestrator = ContextOrchestrator(
 
 ---
 
-## 工具调用与多模态
+## Tool Calls & Multimodal
 
-### 工具调用（Tool Calls）
+### Tool calls
 
-lethes 完整支持 OpenAI tool calls 格式，无需任何额外配置：
+lethes fully supports the OpenAI tool calls format with no extra configuration:
 
 ```
-用户消息
+user message
   ↓
-assistant (content=null, tool_calls=[{id, type, function}])  ← 自动设为对方的依赖
+assistant  (content=null, tool_calls=[{id, type, function}])  ← auto-bound as dependency
   ↓
-tool (tool_call_id=..., content="结果")                       ← 自动设为对方的依赖
+tool       (tool_call_id=..., content="result")               ← auto-bound as dependency
   ↓
-assistant ("根据工具结果，答案是…")
+assistant  ("Based on the tool result, the answer is…")
 ```
 
-**关键保证：**
+**Guarantees:**
 
-| 问题 | lethes 的处理 |
+| Scenario | lethes behaviour |
 |---|---|
-| tool result 被保留，但 assistant tool_calls 被截断 | ConstraintChecker 自动将 assistant 提升到 keep |
-| assistant tool_calls 被保留，但 tool result 被截断 | ConstraintChecker 自动将 tool result 提升到 keep |
-| tool 消息有预计算摘要，算法想摘要它 | 拒绝摘要，改为 drop（工具对不可拆分） |
-| 一次调用多个并行工具 | 全部双向绑定，整组保持一致 |
+| Tool result kept, assistant tool_calls dropped | `ConstraintChecker` promotes the assistant to `keep` |
+| Assistant tool_calls kept, tool result dropped | `ConstraintChecker` promotes the tool result to `keep` |
+| Parallel tool calls (multiple in one turn) | All pairs are bound bidirectionally and kept together |
+| A tool message has a cached summary and the algorithm wants to summarize it | Summarization refused; treated as `drop` (tool pairs are indivisible) |
 
-依赖关系在 `Conversation.from_openai_messages` 解析时**自动注入**，无需手工设置。
+Dependencies are injected automatically by `Conversation.from_openai_messages` — no manual wiring needed.
 
-### 多模态消息（图片）
+### Multimodal messages
 
 ```python
-# URL 格式
+# URL format
 {"type": "image_url", "image_url": {"url": "https://example.com/img.jpg"}}
 
-# Base64 格式（data URI）
+# Base64 data URI
 {"type": "image_url", "image_url": {
     "url": "data:image/png;base64,iVBOR...",
     "detail": "high"   # "low" | "high" | "auto"
 }}
 ```
 
-- 编排时提取 `type=text` 块做权重计算和摘要
-- 图片块（`image_url`、`image` 等）**原样透传**，不被修改或丢弃
-- 包含图片的消息的词元计数只统计文字部分（图片 token 由 API 自行计算）
+- Only `type=text` blocks are used for weight scoring and summarization
+- Image blocks are passed through unchanged
+- Token counting covers text content only (image tokens are billed by the API)
 
 ---
 
-## 编排逻辑详解
+## How Orchestration Works
 
-### 消息重要性评分公式
+### Message importance score
 
-每条消息的最终权重由三个因子相乘得到：
+Each message's final weight is a product of three factors:
 
 ```
 weight = base_weight × relevance_score × recency_multiplier
 ```
 
-其中 `relevance_score` 由 `SmartWeightingStrategy` 计算：
+`relevance_score` is computed by `SmartWeightingStrategy`:
 
 ```
 relevance_score(msg_i) = keyword_score(msg_i, query)
@@ -202,231 +205,231 @@ relevance_score(msg_i) = keyword_score(msg_i, query)
                        × role_factor(msg_i)
 ```
 
-| 因子 | 公式 | 说明 |
+| Factor | Formula | Description |
 |---|---|---|
-| `keyword_score` | BM25 归一化到 [floor, 1.0] | 消息文本与当前 query 的关键词重叠程度 |
-| `pair_coherence_boost` | `max(kw_score, coherence × prev_user_score)` | assistant 回复继承上一条 user 消息的分数（Q&A 对不被拆散） |
-| `role_factor` | `tool_penalty` if role=tool or tool_calls else 1.0 | 工具调用中间结果降权 |
+| `keyword_score` | BM25 normalised to [floor, 1.0] | Keyword overlap between message text and the current query |
+| `pair_coherence_boost` | `max(kw_score, coherence × prev_user_score)` | Assistant replies inherit part of the preceding user message's score — keeps Q&A pairs together |
+| `role_factor` | `tool_penalty` if role=tool or has tool_calls, else 1.0 | Downweights intermediate tool-call messages |
 
-`recency_multiplier` 由 `RecencyBiasedAlgorithm` 在选择阶段施加：
+`recency_multiplier` is applied by `RecencyBiasedAlgorithm` during selection:
 
 ```
 recency_multiplier = 1 + factor × (position_from_oldest / (n - 1))
 ```
 
-最旧消息乘以 1.0，最新消息乘以 `1 + factor`（默认 factor=1.5 → 2.5x）。
+Oldest message → ×1.0; newest message → ×(1 + factor). Default `factor=2.0`.
 
-### 选择流程图解
+### Selection pipeline
 
 ```
-所有消息 (n条)
+All messages (n)
     │
-    ▼ SmartWeightingStrategy
-    │  ① BM25 关键词打分
-    │  ② pair coherence 提升 assistant 回复
-    │  ③ tool 消息降权 × tool_penalty
+    ▼ WeightingStrategy.score()
+    │  keyword scoring, pair coherence boost, tool downweight
     │
-    ▼ RecencyBiasedAlgorithm
-    │  ④ 近期乘数 (线性递增到 1+factor)
-    │  ⑤ 按 weight 排序 → 贪心填满预算
+    ▼ algorithm.select()
+    │  sort by weight → greedy fill within budget
+    │  (recency multiplier applied here by RecencyBiasedAlgorithm)
     │
-    ▼ ConstraintChecker.repair
-       ⑥ 强制保留最后一条 user 消息
-       ⑦ 解析 dependencies → tool 对永不分离
-       ⑧ 满足 min_chat_messages
+    ▼ ConstraintChecker.repair()
+       force-keep last user message
+       resolve dependencies → tool pairs never split
+       satisfy min_chat_messages
 ```
 
-### 子智能体分析（LLMContextAnalyzer）
+### LLM sub-agent analysis (`LLMContextAnalyzer`)
 
-除了关键词相关性，还可以启用 LLM 子智能体对消息重要性做语义分析。
+Beyond keyword relevance, you can enable an LLM sub-agent for semantic importance classification.
 
-**关键设计：五档分类而非浮点打分。**
+**Key design: five-label classification, not floating-point scores.**
 
-LLM 不擅长输出校准的浮点数（0.73 和 0.75 对它来说没有区别），但它非常擅长做分类决策。每条消息被分入五档之一：
+LLMs are poor at calibrated floats (0.73 vs 0.75 means nothing to them) but excellent at classification. Each message gets one label:
 
-| 标签 | 含义 | 映射权重 |
+| Label | Meaning | Weight |
 |---|---|---|
-| **K** Keep | 必须保留：直接回答当前问题 | 1.00 |
-| **H** Helpful | 应该保留：有用的背景信息 | 0.75 |
-| **M** Maybe | 中性：可能有用，预算允许再保留 | 0.50 |
-| **S** Skip | 可跳过：可能不需要，旧内容或偏题 | 0.25 |
-| **D** Drop | 丢弃：与当前问题明显无关 | 0.05 |
+| **K** Keep | Must keep — directly answers the current question | 1.00 |
+| **H** Helpful | Should keep — useful background context | 0.75 |
+| **M** Maybe | Neutral — marginally relevant, keep if budget allows | 0.50 |
+| **S** Skip | Likely not needed — old, off-topic, or superseded | 0.25 |
+| **D** Drop | Clearly irrelevant to the current question | 0.05 |
 
-LLM 输出格式（极简，节省 token）：
+Output format (compact, minimal tokens):
 ```json
 {"labels": ["K", "H", "M", "S", "D", ...]}
 ```
 
-解析器支持三种容错格式：JSON object → JSON array → 正则提取字母（应对 LLM 不严格遵守格式的情况）。
+The parser accepts three fallback formats: JSON object → JSON array → regex letter extraction.
 
 ```python
 from lethes.weighting import CompositeWeightStrategy, SmartWeightingStrategy
 from lethes.weighting.llm_analyzer import LLMContextAnalyzer
+from lethes.cache import RedisCache
 
 weighting = CompositeWeightStrategy([
-    (SmartWeightingStrategy(), 0.4),          # 快速关键词信号（无 API 调用）
-    (LLMContextAnalyzer(                       # 语义分类（五档，结果缓存）
+    (SmartWeightingStrategy(), 0.4),       # fast keyword signal (no API call)
+    (LLMContextAnalyzer(                    # semantic 5-label classification (cached)
         api_base="https://api.openai.com/v1",
         api_key="sk-...",
         model="gpt-4o-mini",
         cache=RedisCache.from_url("redis://..."),
     ), 0.6),
 ])
+```
+
+`LLMContextAnalyzer` also supports an optional **two-phase entry logic** (`use_entry_logic=True`): it first receives a compact topic-cluster overview, then calls an `expand_topic` tool to examine specific clusters in detail before labelling — useful for very long conversations where the full message list would overflow the sub-agent's context.
 
 ---
 
-## Flag 控制语法
+## Flag Control Syntax
 
-用户可以在对话消息开头用 `!` 前缀直接控制编排行为：
+Users control orchestration behaviour inline with a `!` prefix:
 
 ```
-!key=value,+persistKey=value2,-closeFeature 消息正文
+!key=value,+persistKey=value2,-closeFeature message body
 ```
 
-| 前缀 | 含义 | 示例 |
+| Prefix | Meaning | Example |
 |---|---|---|
-| `!key` / `!key=val` | 临时 flag，仅当前轮有效 | `!nosum` |
-| `!+key` / `!+key=val` | 持久 flag，写入会话状态 | `!+pin` |
-| `!-key` | 移除持久 flag | `!-pin` |
+| `!key` / `!key=val` | Temporary — current turn only | `!nosum` |
+| `!+key` / `!+key=val` | Persistent — stored in session state | `!+pin` |
+| `!-key` | Remove a persistent flag | `!-pin` |
 
-### 内置 Flag
+### Built-in flags
 
-#### 截断 / 预算控制
+#### Truncation / budget control
 
-| Flag | 作用 |
+| Flag | Effect |
 |---|---|
-| `!full` | 关闭所有截断，传递完整上下文 |
-| `!target=N` | 设置本轮 token 目标（尽量接近 N，而非上限） |
-| `!context=N` | 本轮只保留最近 N 轮对话 |
-| `!nosum` | 禁止摘要，超限消息直接丢弃 |
+| `!full` | Disable all truncation, pass the full context |
+| `!target=N` | Token target for this turn (aim for N, not a hard cap) |
+| `!context=N` | Keep only the most recent N conversation turns |
+| `!nosum` | Disable summarization; over-budget messages are dropped |
 
-#### 强制保留（锚定）
+#### Anchoring (force-keep)
 
-| Flag | 作用 |
+| Flag | Effect |
 |---|---|
-| `!pin` | 固定**当前**消息，永不截断或压缩 |
-| `!recent=N` | 强制保留最近 N 条非系统消息（无论权重） |
-| `!keep_tag=标签` | 保留所有带该标签的消息（配合 `!+tag=` 使用） |
+| `!pin` | Pin the **current** message — never truncated or summarized |
+| `!recent=N` | Force-keep the N most recent non-system messages, regardless of weight |
+| `!keep_tag=label` | Keep all messages with the given tag (use with `!+tag=`) |
 
-#### 权重覆盖
+#### Weight overrides
 
-| Flag | 作用 |
+| Flag | Effect |
 |---|---|
-| `!weight=N` | 设置当前消息的基础权重（默认 1.0） |
-| `!tool_penalty=F` | 本轮工具调用中间消息的权重乘数（默认 0.5） |
-| `!pair_coherence=F` | 本轮 Q&A 对相干系数（0.0–1.0，默认 0.8） |
+| `!weight=N` | Base weight of the current message (default 1.0) |
+| `!tool_penalty=F` | Override tool-call downweight multiplier for this turn |
+| `!pair_coherence=F` | Override Q&A coherence factor for this turn (0.0–1.0) |
 
-#### 消息元数据
+#### Metadata
 
-| Flag | 作用 |
+| Flag | Effect |
 |---|---|
-| `!tag=标签名` | 为当前消息添加标签（配合 `!keep_tag=` 使用） |
+| `!tag=label` | Attach a tag to the current message (use with `!keep_tag=`) |
 
-**示例：**
+**Examples:**
 
 ```
-# 重要背景，永久固定
-!+pin 这是重要的系统背景，请始终参考。
+# Pin important background permanently
+!+pin This is critical system context. Always refer to it.
 
-# 强制保留最近 4 条消息 + 设置紧凑 token 目标
-!recent=4,target=6000 请基于最近对话回答。
+# Force keep last 4 messages + compact token target
+!recent=4,target=6000 Answer based on the recent conversation.
 
-# 本轮不需要工具调用历史（降低工具权重）
-!tool_penalty=0.1 请总结一下对话，忽略工具调用细节。
+# Deprioritize tool call history this turn
+!tool_penalty=0.1 Summarize the conversation, ignoring tool-call details.
 
-# 标记重要消息，之后可按标签保留
-!+tag=key_decision 我们决定使用 PostgreSQL 作为主数据库。
-# ... 若干轮后 ...
-!keep_tag=key_decision 请基于我们之前的架构决策继续。
+# Tag a key decision and retrieve it by tag later
+!+tag=key_decision We decided to use PostgreSQL as the primary database.
+# ... several turns later ...
+!keep_tag=key_decision Continue based on our earlier architecture decisions.
 ```
 
 ---
 
-## 架构详解
+## Architecture
 
-### 编排流水线（9 步）
-
-```
-原始消息列表 (list[dict], OpenAI 格式)
-        │
-        ▼
-Conversation.from_openai_messages()
-        │
-        ▼
-ContextOrchestrator.process()
-        │
-  ①  Flag 解析         提取 !flag 前缀，写入 SessionFlags，清理消息内容
-  ②  预算覆盖         full → 无限制；context=N → 轮数限制；nosum → 禁摘要
-  ③  词元计数         并发填充每条消息的 token_count
-  ④  动态权重评分     WeightingStrategy.score(messages, query=当前输入)
-                       → message.weight = base_weight × relevance_score
-  ⑤  算法选择        algorithm.select() → SelectionResult{keep/summarize/drop}
-  ⑥  约束修复        ConstraintChecker 确保最后一条用户消息保留、系统消息保留等
-  ⑦  并发摘要        asyncio.gather() 并发压缩所有 summarize 消息（先查缓存）
-  ⑧  上下文组装      system + 压缩摘要块 + 保留消息（按原始顺序）
-  ⑨  前缀记录        PrefixSequenceTracker 记录本次发送序列（供下次缓存优化）
-        │
-        ▼
-OrchestratorResult.conversation.to_openai_messages()
-```
-
-### 动态权重层 (`weighting/`)
-
-**权重不是固定值，而是当前输入与消息内容相关性的实时评分：**
+### Full orchestration pipeline (9 steps)
 
 ```
-message.weight = message.base_weight × relevance_score
+Raw message list  (list[dict], OpenAI format)
+        │
+        ▼  Conversation.from_openai_messages()
+           Parses roles, tool_call dependencies, multimodal blocks
+        │
+        ▼  ContextOrchestrator.process()
+        │
+  ①  Flag parsing      Extract !flag prefixes → SessionFlags; clean message content
+  ②  Budget override   full → unlimited; context=N → turn limit; target=N → soft target
+  ③  Anchor pinning    !recent=N and !keep_tag= pin messages before scoring
+  ④  Token counting    Fill token_count on each message (tiktoken)
+  ⑤  Dynamic weighting WeightingStrategy.score() → message.weight = base × relevance
+  ⑥  Algorithm         algorithm.select() → SelectionResult {keep / summarize / drop}
+  ⑦  Constraint repair ConstraintChecker promotes messages until all rules satisfied
+  ⑧  Summarization     asyncio.gather() compresses all summarize messages (cache-first)
+  ⑨  Assembly + tracking  system msgs + summary block + kept msgs (original order);
+                           PrefixSequenceTracker records sent sequence for next turn
+        │
+        ▼  OrchestratorResult
+           .conversation.to_openai_messages()  → ready for any LLM
+           .run_id          → correlation ID (matches observer log events)
+           .token_count     → total tokens in outgoing conversation
+           .estimated_cost_usd
 ```
 
-`base_weight` 由用户通过 API 或 `!weight=N` flag 设置；
-`relevance_score` 由以下策略之一动态计算：
+### Weighting strategies (`weighting/`)
 
-| 策略 | 速度 | 精度 | 依赖 |
+| Strategy | Speed | Accuracy | Requires |
 |---|---|---|---|
-| `StaticWeightStrategy` | 极快 | — | 无（默认，score=1.0） |
-| `KeywordRelevanceStrategy` | 快 | 中等 | `rank_bm25`（可选）或内置 TF-IDF |
-| `EmbeddingSimilarityStrategy` | 中等 | 高 | 任意嵌入 API（带缓存） |
-| `CompositeWeightStrategy` | 取决于内部策略 | 可配置 | 内部策略的并集 |
+| `StaticWeightStrategy` | Instant | — | Nothing (score = 1.0 for all) |
+| `KeywordRelevanceStrategy` | Fast | Moderate | `rank_bm25` (optional) or built-in TF-IDF |
+| `SmartWeightingStrategy` | Fast | Good | Nothing (keyword + Q&A coherence + tool penalty) |
+| `EmbeddingSimilarityStrategy` | Medium | High | Any embedding API + cache recommended |
+| `LLMContextAnalyzer` | Slow | Highest | Any chat API; results cached (30 min TTL) |
+| `CompositeWeightStrategy` | Depends | Configurable | Union of inner strategies |
 
-`EmbeddingSimilarityStrategy` 支持**话题增强**：通过 `TopicDetector` 识别话题聚类，同话题的消息获得额外分数加成。
-
-### 选择算法 (`algorithms/`)
-
-所有算法实现 `SelectionAlgorithm` 协议（结构化子类型，无需继承）：
+All strategies implement the same protocol:
 
 ```python
-class SelectionAlgorithm(Protocol):
-    def select(
-        self,
-        conversation: Conversation,
-        budget: Budget,
-        constraints: ConstraintSet,
-        token_counter: TokenCounter,
-    ) -> SelectionResult: ...
+async def score(
+    messages: list[Message],
+    query: str,
+    conversation: Conversation,
+    context: dict | None = None,
+) -> dict[str, float]:   # {message_id: relevance_score}
 ```
 
-| 算法 | 说明 |
+### Selection algorithms (`algorithms/`)
+
+```python
+def select(
+    conversation: Conversation,
+    budget: Budget,
+    constraints: ConstraintSet,
+    token_counter: TokenCounter,
+) -> SelectionResult:
+```
+
+| Algorithm | Description |
 |---|---|
-| `GreedyByWeightAlgorithm` | 按 weight 降序贪心填充预算，有摘要则优先摘要替代删除 |
-| `RecencyBiasedAlgorithm` | 对近期消息施加衰减系数后委托给贪心算法 |
-| `DependencyAwareAlgorithm` | 装饰器：确保被保留消息的依赖链也被保留（递归解析） |
-| `PrefixCacheOptimizedAlgorithm` | 固定上次发送的最长公共前缀以最大化 KV 缓存命中，再贪心填充剩余预算 |
+| `GreedyByWeightAlgorithm` | Sort by weight descending, greedily fill budget; prefer summarize over drop (`prefer_summarize=True`) |
+| `RecencyBiasedAlgorithm` | Apply a linear recency multiplier (default `factor=2.0`) then delegate to greedy |
+| `DependencyAwareAlgorithm` | Decorator: ensure kept messages' dependency chains are recursively kept |
+| `PrefixCacheOptimizedAlgorithm` | Lock the longest common prefix from the previous turn to maximize KV-cache hits, then greedy-fill the remainder |
 
-### 多级摘要 (`summarizers/`)
+### Summarizers (`summarizers/`)
 
 ```
-TurnSummarizer      单个 user+assistant 轮 → 摘要字符串（有缓存）
+TurnSummarizer          single turn (user+assistant) → summary string  [cached, TTL=24 h]
       ↓
-SegmentSummarizer   N 轮 → 段落摘要（两遍压缩：先逐轮，再汇总）
+SegmentSummarizer       N turns → segment summary  (two-pass: per-turn then aggregate)
       ↓
-ConversationSummarizer  整个对话 → 高层概述
+ConversationSummarizer  full conversation → high-level overview
 ```
 
-`LLMSummarizer` 通过 httpx 直接调用 `/v1/chat/completions`，不依赖任何 SDK，支持所有兼容 OpenAI 格式的服务。
+`LLMSummarizer` calls `/v1/chat/completions` directly via httpx — no SDK dependency, works with any OpenAI-compatible service. Supports `extra_body` for provider-specific parameters.
 
-### 缓存层 (`cache/`)
-
-实现 `CacheBackend` 协议即可替换：
+### Cache layer (`cache/`)
 
 ```python
 class CacheBackend(Protocol):
@@ -436,50 +439,120 @@ class CacheBackend(Protocol):
     async def exists(self, key: str) -> bool: ...
 ```
 
-内置两种实现：`InMemoryCache`（默认，无依赖）和 `RedisCache`（需要 `lethes[redis]`）。
+| Backend | Import | Notes |
+|---|---|---|
+| `InMemoryCache` | `from lethes.cache import InMemoryCache` | Default; zero dependencies |
+| `RedisCache` | `from lethes.cache import RedisCache` | `RedisCache.from_url("redis://...")` requires `lethes[redis]` |
 
-缓存 key 由消息内容的 SHA-256 哈希派生，语义相同的上下文共享缓存，不会重复调用摘要 API。
+Cache keys are derived from SHA-256 hashes of message content — identical contexts share cache entries.
+
+### Budget types (`models/budget.py`)
+
+| Type | Key parameter | Behaviour |
+|---|---|---|
+| `TokenBudget(max_tokens=N)` | `max_tokens` (0 = unlimited) | Hard token cap |
+| `TokenTargetBudget(target_tokens=N)` | `target_tokens`, `overshoot=150` | Aim to fill to ~N tokens (soft target) |
+| `CostBudget(max_cost_usd=N)` | `max_cost_usd` (0 = unlimited) | Soft USD cost cap |
+| `CompositeBudget(token_budget, cost_budget)` | Both must be satisfied | `CompositeBudget.unlimited()` for pass-through |
 
 ---
 
-## Open WebUI 集成
+## Observability
 
-在 Open WebUI Functions 中直接使用：
+lethes emits structured JSON log events via structlog, keyed by `run_id` per `process()` call. Configure once at startup:
+
+```python
+from lethes import configure_logging
+import logging
+
+configure_logging(
+    level="DEBUG",   # DEBUG | INFO | WARNING | ERROR
+    fmt="json",      # "json" (default) | "console"
+    handlers=[...],  # optional: provide your own logging.Handler list
+)
+```
+
+Each handler with no formatter set receives the structlog JSON formatter automatically.
+
+### lethes-observer
+
+[lethes-observer](../lethes_observer) is a companion real-time dashboard that receives log events over HTTP and provides an in-browser view of pipeline runs, message dispositions, weights, and sub-agent calls.
+
+```python
+from lethes import configure_logging
+from lethes_observer.handler import LethesObserverHandler  # from lethes_observer/
+
+h = LethesObserverHandler("http://localhost:7456")
+configure_logging(level="DEBUG", handlers=[h])
+```
+
+Start the observer server:
+```bash
+cd lethes_observer
+uvicorn server:app --port 7456
+```
+
+---
+
+## Open WebUI Integration
+
+### Installed package
 
 ```python
 from lethes.integrations.open_webui import OpenWebUIFilter as Filter
 ```
 
-或将 `src/lethes/integrations/open_webui.py` 复制到 Open WebUI functions 目录。
+Core Valves (no observer / live pricing):
 
-`Valves` 配置项：
-
-| 参数 | 默认值 | 说明 |
+| Valve | Default | Description |
 |---|---|---|
-| `max_tokens` | `10000` | 上下文词元上限（0 = 不限） |
-| `max_turns` | `25` | 保留最近 N 轮（暂未启用，用 `!context=N` 替代） |
-| `algorithm` | `greedy_by_weight` | 选择算法 |
-| `recency_factor` | `2.0` | 近期偏置系数 |
-| `weighting` | `keyword` | 权重策略（`static` / `keyword`） |
-| `summary_api_base` | OpenAI | 摘要 API 地址 |
-| `summary_api_key` | — | 摘要 API 密钥 |
-| `summary_model` | `gpt-4o-mini` | 摘要模型 |
-| `cache_backend` | `memory` | 缓存后端（`memory` / `redis`） |
-| `redis_url` | `redis://redis:6379/0` | Redis 地址 |
+| `max_tokens` | `10000` | Token limit (0 = unlimited) |
+| `algorithm` | `recency_biased` | `greedy_by_weight` / `recency_biased` / `dependency_aware` |
+| `recency_factor` | `1.5` | Recency bias strength |
+| `weighting` | `smart` | `static` / `keyword` / `smart` |
+| `tool_penalty` | `0.5` | Weight multiplier for tool-call messages |
+| `pair_coherence` | `0.8` | Score fraction inherited by assistant replies |
+| `llm_analysis` | `false` | Enable LLM sub-agent context analysis |
+| `llm_analysis_weight` | `0.6` | LLM analysis fraction in composite weighting |
+| `summary_api_base` | OpenAI | OpenAI-compatible API for summarization / LLM analysis |
+| `summary_api_key` | — | API key |
+| `summary_model` | `gpt-4o-mini` | Model for summarization / LLM analysis |
+| `summary_target_ratio` | `0.3` | Summarization compression ratio |
+| `retry_attempts` | `3` | Retry attempts for summarization calls |
+| `nosum_by_default` | `false` | Globally disable summarization |
+| `cache_backend` | `memory` | `memory` / `redis` |
+| `redis_url` | `redis://redis:6379/0` | Redis URL |
+| `pricing_config_path` | — | Path to custom pricing JSON |
+
+### Standalone filter (`lethes_observer/helper/open_webui_filter.py`)
+
+The standalone file can be dropped directly into your Open WebUI functions directory — no package install needed. It includes all base Valves plus:
+
+| Valve | Default | Description |
+|---|---|---|
+| `use_openrouter_pricing` | `true` | Fetch live model pricing from OpenRouter API |
+| `pricing_cache_ttl_hours` | `24.0` | How long to cache OpenRouter pricing data |
+| `model_aliases` | `{}` | JSON map of raw model IDs → canonical names, applied before prefix-stripping. Example: `{"poe.gemini-3-flash": "gemini-3-flash-preview"}` |
+| `observer_url` | — | lethes-observer server URL (e.g. `http://localhost:7456`) |
+| `observer_log_level` | `DEBUG` | Log level forwarded to the observer |
+
+The standalone filter also:
+- Reads actual token counts and cost from the LLM response body (`outlet()`) rather than always estimating
+- Logs a `pipeline.outlet` event so the observer can display real vs estimated cost
 
 ---
 
-## 通用中间件
+## Generic Middleware
 
 ```python
 from lethes.integrations import LethesMiddleware
 
 middleware = LethesMiddleware(orchestrator=my_orchestrator)
 
-# 直接调用
+# Direct call
 processed = await middleware(raw_messages, model_id="gpt-4o")
 
-# 作为装饰器
+# As a decorator
 @middleware.wrap
 async def call_llm(messages, **kwargs):
     return await client.chat.completions.create(
@@ -489,12 +562,12 @@ async def call_llm(messages, **kwargs):
 
 ---
 
-## 自定义扩展
+## Custom Extensions
 
-所有核心扩展点均为 `Protocol`（结构化子类型），无需继承基类：
+All extension points are `Protocol` types — no base class required:
 
 ```python
-# 自定义权重策略
+# Custom weighting strategy
 class MyWeightingStrategy:
     async def score(
         self,
@@ -502,49 +575,74 @@ class MyWeightingStrategy:
         query: str,
         conversation: Conversation,
         context: dict | None = None,
-    ) -> dict[str, float]:
-        # 返回 {message_id: 相关性分数} 即可
+    ) -> dict[str, float]:   # {message_id: relevance_score}
         ...
     def name(self) -> str: return "my_strategy"
 
-# 自定义选择算法
+# Custom selection algorithm
 class MyAlgorithm:
-    def select(self, conversation, budget, constraints, token_counter) -> SelectionResult:
+    def select(
+        self,
+        conversation: Conversation,
+        budget: Budget,
+        constraints: ConstraintSet,
+        token_counter: TokenCounter,
+    ) -> SelectionResult:
         ...
     def name(self) -> str: return "my_algo"
 
-# 自定义摘要后端
+# Custom summarization backend
 class MySummarizer:
-    async def summarize(self, messages, *, target_ratio=0.3, context_messages=None) -> str:
+    async def summarize(
+        self,
+        messages: list[Message],
+        *,
+        target_ratio: float = 0.3,
+        context_messages: list[Message] | None = None,
+    ) -> str:
         ...
     def name(self) -> str: return "my_summarizer"
+
+# Custom cache backend
+class MyCache:
+    async def get(self, key: str) -> str | None: ...
+    async def set(self, key: str, value: str, ttl: int | None = None) -> None: ...
+    async def delete(self, key: str) -> None: ...
+    async def exists(self, key: str) -> bool: ...
 ```
 
 ---
 
-## 项目结构
+## Project Structure
 
 ```
 src/lethes/
-├── models/           消息、对话、预算、定价模型
-├── flags/            Flag 语法解析器与会话状态管理
-├── weighting/        动态相关性评分层
-├── algorithms/       上下文选择算法
-├── cache/            缓存后端与前缀序列追踪
-├── summarizers/      多级摘要实现
-├── engine/           约束检查、编排计划、主编排器
-├── integrations/     Open WebUI Filter & 通用中间件
-├── config/pricing/   内置模型定价表（JSON）
-└── utils/            词元计数、内容提取、ID 生成
+├── models/           Messages, conversations, budgets, pricing models
+├── flags/            Flag syntax parser and session state
+├── weighting/        Dynamic relevance scoring strategies
+│   ├── static.py     StaticWeightStrategy
+│   ├── keyword.py    KeywordRelevanceStrategy
+│   ├── smart.py      SmartWeightingStrategy
+│   ├── embedding.py  EmbeddingSimilarityStrategy
+│   ├── llm_analyzer.py  LLMContextAnalyzer
+│   └── composite.py  CompositeWeightStrategy
+├── algorithms/       Context selection algorithms
+├── cache/            Cache backends + prefix sequence tracker
+├── summarizers/      LLMSummarizer, TurnSummarizer, SegmentSummarizer, ConversationSummarizer
+├── engine/           ConstraintChecker, ContextPlan, ContextOrchestrator
+├── integrations/     OpenWebUIFilter, LethesMiddleware
+├── config/pricing/   Bundled model pricing table (JSON)
+├── observability.py  configure_logging, get_logger, make_formatter
+└── utils/            Token counting, content extraction, ID generation
 ```
 
 ---
 
-## 定价表
+## Bundled Pricing Table
 
-内置 `default_pricing.json` 涵盖主流模型（USD / 1M tokens），支持 glob 匹配：
+`default_pricing.json` covers major models (USD / 1 M tokens) with glob-pattern matching:
 
-| 模型族 | 输入 | 缓存命中 | 输出 |
+| Model family | Input | Cache hit | Output |
 |---|---|---|---|
 | GPT-4o | $2.50 | $1.25 | $10.00 |
 | GPT-4o-mini | $0.15 | $0.075 | $0.60 |
@@ -553,7 +651,7 @@ src/lethes/
 | Gemini 2.0 Flash | $0.10 | $0.025 | $0.40 |
 | Gemini 2.5 Pro | $1.25 | $0.31 | $10.00 |
 
-可通过 `Valves.pricing_config_path` 指定自定义定价文件。
+Override with `pricing_config_path`, or enable live pricing with `use_openrouter_pricing` (standalone filter only).
 
 ---
 

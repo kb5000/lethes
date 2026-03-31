@@ -62,6 +62,8 @@ class OrchestratorResult:
     """Total tokens in the outgoing conversation."""
 
     estimated_cost_usd: float | None = None
+    run_id: str | None = None
+    """Correlation ID for this pipeline run (matches observability log events)."""
 
 
 class ContextOrchestrator:
@@ -147,8 +149,13 @@ class ContextOrchestrator:
         10. Prefix tracking — record the sent sequence
         """
         t0 = time.perf_counter()
+        run_id = str(uuid.uuid4())
+        # Bind run_id into the contextvars context so all sub-component loggers
+        # (llm_analyzer, summarizer, embedding) automatically carry it.
+        import structlog as _structlog
+        _structlog.contextvars.bind_contextvars(run_id=run_id)
+
         log = logger.bind(
-            run_id=str(uuid.uuid4()),
             model_id=model_id,
             session_id=str(conversation.session_id) if conversation.session_id else None,
             n_input=len(conversation.messages),
@@ -205,7 +212,7 @@ class ContextOrchestrator:
                 dropped=0,
                 summarized=0,
             )
-            return self._build_result(conversation, plan, session_flags, model_id)
+            return self._build_result(conversation, plan, session_flags, model_id, run_id=run_id)
 
         # Step 5: Dynamic weighting — pass flag overrides in context
         last_user = conversation.last_user_message()
@@ -261,18 +268,6 @@ class ContextOrchestrator:
             pre_plan_tokens=pre_plan_tokens,
         )
 
-        msg_plan: list[dict[str, Any]] = []
-        for _m in conversation.messages:
-            _info = _msg_summary(_m)
-            if _m.id in plan.summarize:
-                _info["disposition"] = "summarized"
-            elif _m.id in plan.drop:
-                _info["disposition"] = "dropped"
-            else:
-                _info["disposition"] = "kept"
-            msg_plan.append(_info)
-        log.debug("pipeline.messages_plan", messages=msg_plan)
-
         # Emit status event
         if event_emitter and plan.total_dropped > 0:
             await _emit_status(
@@ -287,6 +282,21 @@ class ContextOrchestrator:
             conversation = await self._execute_summarization(
                 conversation, plan, self._turn_summarizer
             )
+
+        # Log messages_plan after summarisation so summary text is included.
+        msg_plan: list[dict[str, Any]] = []
+        for _m in conversation.messages:
+            _info = _msg_summary(_m)
+            if _m.id in plan.summarize:
+                _info["disposition"] = "summarized"
+                if _m.summary is not None:
+                    _info["summary_tokens"] = self._token_counter.count_text(_m.summary)
+            elif _m.id in plan.drop:
+                _info["disposition"] = "dropped"
+            else:
+                _info["disposition"] = "kept"
+            msg_plan.append(_info)
+        log.debug("pipeline.messages_plan", messages=msg_plan)
 
         # Step 9: Assembly
         final_conversation = self._assemble(conversation, plan, nosum=nosum)
@@ -304,7 +314,7 @@ class ContextOrchestrator:
             sent_ids = [m.id for m in final_conversation.messages]
             await self._prefix_tracker.record(conversation.session_id, sent_ids)
 
-        result = self._build_result(final_conversation, plan, session_flags, model_id)
+        result = self._build_result(final_conversation, plan, session_flags, model_id, run_id=run_id)
         log.info("pipeline.complete",
             output_tokens=result.token_count,
             cost_usd=result.estimated_cost_usd,
@@ -467,6 +477,7 @@ class ContextOrchestrator:
         plan: ContextPlan,
         session_flags: "SessionFlags",
         model_id: str | None,
+        run_id: str | None = None,
     ) -> OrchestratorResult:
         token_count = sum(
             self._token_counter.count(m) for m in conversation.messages
@@ -484,6 +495,7 @@ class ContextOrchestrator:
             flags=session_flags,
             token_count=token_count,
             estimated_cost_usd=cost,
+            run_id=run_id,
         )
 
 
@@ -498,6 +510,8 @@ def _msg_summary(m: Message, preview_len: int = 180) -> dict[str, Any]:
         "role": m.role,
         "tokens": m.token_count or 0,
         "preview": preview,
+        "content": text,
+        "weight": round(m.weight, 3),
     }
     if m.pinned:
         d["pinned"] = True
@@ -505,6 +519,8 @@ def _msg_summary(m: Message, preview_len: int = 180) -> dict[str, Any]:
         d["tool_calls"] = [
             tc.get("function", {}).get("name", "?") for tc in m.tool_calls
         ]
+    if m.summary is not None:
+        d["summary"] = m.summary
     return d
 
 

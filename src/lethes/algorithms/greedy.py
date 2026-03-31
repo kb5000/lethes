@@ -82,17 +82,22 @@ class GreedyByWeightAlgorithm:
                 # Try summary first — but never summarize tool call pairs,
                 # since they must remain structurally intact for the API.
                 is_tool_pair = msg.role == "tool" or bool(msg.tool_calls)
-                if (
-                    self._prefer_summarize
-                    and msg.summary is not None
-                    and not is_tool_pair
-                ):
-                    summary_tokens = token_counter.count_text(msg.summary)
-                    if headroom < 0 or summary_tokens <= headroom:
+                if self._prefer_summarize and not is_tool_pair:
+                    if msg.summary is not None:
+                        # Summary already exists: check it fits the remaining budget.
+                        summary_tokens = token_counter.count_text(msg.summary)
+                        if headroom < 0 or summary_tokens <= headroom:
+                            summarize.append(msg.id)
+                            used_tokens += summary_tokens
+                            if headroom >= 0:
+                                headroom -= summary_tokens
+                            continue
+                    else:
+                        # No summary yet — mark for generation by TurnSummarizer.
+                        # Don't charge budget now; the summary will be much shorter
+                        # than the original and is accounted for on the next call
+                        # once it is cached.
                         summarize.append(msg.id)
-                        used_tokens += summary_tokens
-                        if headroom >= 0:
-                            headroom -= summary_tokens
                         continue
                 drop.append(msg.id)
 
