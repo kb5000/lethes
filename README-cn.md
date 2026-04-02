@@ -45,7 +45,7 @@ pip install lethes[langchain]       # LangChain 适配器
 pip install lethes[all]             # 安装所有可选依赖
 ```
 
-**最低要求：** Python 3.11+，tiktoken，pydantic ≥ 2，pydantic-settings ≥ 2，httpx ≥ 0.27，structlog ≥ 24
+**最低要求：** Python 3.11+，tiktoken，pydantic ≥ 2，httpx ≥ 0.27，structlog ≥ 24
 
 ---
 
@@ -521,7 +521,8 @@ from lethes.integrations.open_webui import OpenWebUIFilter as Filter
 | `nosum_by_default` | `false` | 全局禁用摘要 |
 | `cache_backend` | `memory` | `memory` / `redis` |
 | `redis_url` | `redis://redis:6379/0` | Redis 连接地址 |
-| `pricing_config_path` | — | 自定义定价 JSON 文件路径 |
+| `pricing_config_path` | — | 自定义定价 JSON 文件路径；留空则使用 OpenRouter 实时定价 |
+| `openrouter_pricing` | `true` | 启动时从 OpenRouter 获取实时模型定价；离线/隔离网络环境下可关闭 |
 
 ### 独立 filter（`lethes_observer/helper/open_webui_filter.py`）
 
@@ -628,27 +629,9 @@ src/lethes/
 ├── summarizers/      LLMSummarizer、TurnSummarizer、SegmentSummarizer、ConversationSummarizer
 ├── engine/           约束检查、编排计划、主编排器
 ├── integrations/     OpenWebUIFilter、LethesMiddleware
-├── config/pricing/   内置模型定价表（JSON）
 ├── observability.py  configure_logging、get_logger、make_formatter
 └── utils/            词元计数、内容提取、ID 生成
 ```
-
----
-
-## 内置定价表
-
-`default_pricing.json` 涵盖主流模型（USD / 1M tokens），支持 glob 匹配：
-
-| 模型族 | 输入 | 缓存命中 | 输出 |
-|---|---|---|---|
-| GPT-4o | $2.50 | $1.25 | $10.00 |
-| GPT-4o-mini | $0.15 | $0.075 | $0.60 |
-| Claude Sonnet 4 / 3.5 | $3.00 | $0.30 | $15.00 |
-| Claude Haiku 4 / 3.5 | $0.80 | $0.08 | $4.00 |
-| Gemini 2.0 Flash | $0.10 | $0.025 | $0.40 |
-| Gemini 2.5 Pro | $1.25 | $0.31 | $10.00 |
-
-可通过 `pricing_config_path` 指定自定义定价文件，或在独立 filter 中启用 `use_openrouter_pricing` 获取实时定价。
 
 ---
 

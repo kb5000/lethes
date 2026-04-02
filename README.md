@@ -522,7 +522,8 @@ Core Valves (no observer / live pricing):
 | `nosum_by_default` | `false` | Globally disable summarization |
 | `cache_backend` | `memory` | `memory` / `redis` |
 | `redis_url` | `redis://redis:6379/0` | Redis URL |
-| `pricing_config_path` | — | Path to custom pricing JSON |
+| `pricing_config_path` | — | Path to a custom pricing JSON file; leave empty to use OpenRouter live pricing |
+| `openrouter_pricing` | `true` | Fetch live model pricing from OpenRouter at startup; disable in offline/air-gapped environments |
 
 ### Standalone filter (`lethes_observer/helper/open_webui_filter.py`)
 
@@ -631,27 +632,9 @@ src/lethes/
 ├── summarizers/      LLMSummarizer, TurnSummarizer, SegmentSummarizer, ConversationSummarizer
 ├── engine/           ConstraintChecker, ContextPlan, ContextOrchestrator
 ├── integrations/     OpenWebUIFilter, LethesMiddleware
-├── config/pricing/   Bundled model pricing table (JSON)
 ├── observability.py  configure_logging, get_logger, make_formatter
 └── utils/            Token counting, content extraction, ID generation
 ```
-
----
-
-## Bundled Pricing Table
-
-`default_pricing.json` covers major models (USD / 1 M tokens) with glob-pattern matching:
-
-| Model family | Input | Cache hit | Output |
-|---|---|---|---|
-| GPT-4o | $2.50 | $1.25 | $10.00 |
-| GPT-4o-mini | $0.15 | $0.075 | $0.60 |
-| Claude Sonnet 4 / 3.5 | $3.00 | $0.30 | $15.00 |
-| Claude Haiku 4 / 3.5 | $0.80 | $0.08 | $4.00 |
-| Gemini 2.0 Flash | $0.10 | $0.025 | $0.40 |
-| Gemini 2.5 Pro | $1.25 | $0.31 | $10.00 |
-
-Override with `pricing_config_path`, or enable live pricing with `use_openrouter_pricing` (standalone filter only).
 
 ---
 
