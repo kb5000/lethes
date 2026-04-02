@@ -138,13 +138,27 @@ class OpenWebUIFilter:
             default="redis://redis:6379/0", description="Redis URL (only used with redis cache)"
         )
         pricing_config_path: str = Field(
-            default="", description="Path to custom pricing JSON (leave empty for defaults)"
+            default="",
+            description=(
+                "Path to a custom pricing JSON file. "
+                "Leave empty to use OpenRouter live pricing (recommended) "
+                "or no pricing if openrouter_pricing is also disabled."
+            ),
+        )
+        openrouter_pricing: bool = Field(
+            default=True,
+            description=(
+                "Fetch live model pricing from OpenRouter at startup. "
+                "Enables cost estimation in logs. "
+                "Set to False to disable (e.g. in offline/air-gapped environments)."
+            ),
         )
 
     def __init__(self) -> None:
         self.valves = self.Valves()
         self._orchestrator: ContextOrchestrator | None = None
         self._orchestrator_config_key: tuple | None = None
+        self._pricing_table: ModelPricingTable | None = None
         # Telemetry
         self._input_tokens: int = 0
         self._output_tokens: int = 0
@@ -170,6 +184,10 @@ class OpenWebUIFilter:
         messages = body.get("messages", [])
         if not messages:
             return body
+
+        # Fetch live pricing on first call (cached afterwards)
+        if self._pricing_table is None:
+            self._pricing_table = await self._load_pricing()
 
         conversation = Conversation.from_openai_messages(messages)
         orchestrator = self._get_orchestrator()
@@ -302,23 +320,13 @@ class OpenWebUIFilter:
                 (analyzer, w),
             ])
 
-        # Pricing
-        pricing: ModelPricingTable | None = None
-        if self.valves.pricing_config_path:
-            try:
-                pricing = ModelPricingTable.from_json(self.valves.pricing_config_path)
-            except Exception:
-                pricing = ModelPricingTable.default()
-        else:
-            pricing = ModelPricingTable.default()
-
         self._orchestrator = ContextOrchestrator(
             budget=TokenBudget(max_tokens=self.valves.max_tokens),
             algorithm=algo,
             weighting=weighting,
             turn_summarizer=turn_summarizer,
             cache=cache,
-            pricing_table=pricing,
+            pricing_table=self._pricing_table,
             constraints=ConstraintSet(
                 min_chat_messages=1,
                 require_last_user=True,
@@ -326,3 +334,21 @@ class OpenWebUIFilter:
         )
         self._orchestrator_config_key = config_key
         return self._orchestrator
+
+    async def _load_pricing(self) -> ModelPricingTable:
+        """Load pricing table: custom JSON path → OpenRouter live → empty."""
+        if self.valves.pricing_config_path:
+            try:
+                return ModelPricingTable.from_json(self.valves.pricing_config_path)
+            except Exception:
+                logger.warning("pricing.load_failed", path=self.valves.pricing_config_path)
+
+        if self.valves.openrouter_pricing:
+            try:
+                table = await ModelPricingTable.from_openrouter_async()
+                logger.info("pricing.openrouter_loaded", n_models=len(table._entries))
+                return table
+            except Exception as exc:
+                logger.warning("pricing.openrouter_failed", error=str(exc))
+
+        return ModelPricingTable.empty()

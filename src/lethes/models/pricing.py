@@ -38,8 +38,23 @@ class ModelPricingEntry:
 
 class ModelPricingTable:
     """
-    Loaded from a JSON file.  Supports glob matching on ``model_id``
-    so a single entry like ``"gpt-4o*"`` covers all GPT-4o variants.
+    Pricing table for LLM cost estimation.  Supports glob matching on
+    ``model_id`` so a single entry like ``"gpt-4o*"`` covers all variants.
+
+    Recommended usage — fetch live prices from OpenRouter::
+
+        # sync
+        table = ModelPricingTable.from_openrouter()
+
+        # async (preferred in async code paths)
+        table = await ModelPricingTable.from_openrouter_async()
+
+    Or build from a custom list::
+
+        table = ModelPricingTable.from_list([
+            {"model_id": "my-model", "input_price_per_1m": 1.0,
+             "cached_price_per_1m": 0.1, "output_price_per_1m": 3.0},
+        ])
     """
 
     def __init__(self, entries: list[ModelPricingEntry]) -> None:
@@ -67,11 +82,8 @@ class ModelPricingTable:
         return cls(entries)
 
     @classmethod
-    def default(cls) -> "ModelPricingTable":
-        """Load the bundled default pricing table."""
-        default_path = Path(__file__).parent.parent / "config" / "pricing" / "default_pricing.json"
-        if default_path.exists():
-            return cls.from_json(default_path)
+    def empty(cls) -> "ModelPricingTable":
+        """Return an empty table (cost estimation always returns 0.0)."""
         return cls([])
 
     @classmethod
