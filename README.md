@@ -31,7 +31,7 @@ Traditional context management is a sliding window — truncate from the front w
 - **Tool-call aware** — full OpenAI tool calls support; automatically binds assistant/tool message pairs so truncation never produces an invalid sequence
 - **Multimodal-ready** — native `image_url` content blocks (URL and base64); text is extracted for scoring, image blocks are passed through untouched
 - **Vendor-agnostic** — summarization and embedding use any OpenAI-compatible endpoint (Ollama, vLLM, OpenRouter, …)
-- **Structured observability** — structlog-based JSON events; plug in [lethes-observer](../lethes_observer) for a real-time web dashboard
+- **Structured observability** — structlog-based JSON events; plug in [lethes-observer](https://github.com/kb5000/lethes-observer) for a real-time web dashboard
 
 ---
 
@@ -476,7 +476,7 @@ Each handler with no formatter set receives the structlog JSON formatter automat
 
 ### lethes-observer
 
-[lethes-observer](../lethes_observer) is a companion real-time dashboard that receives log events over HTTP and provides an in-browser view of pipeline runs, message dispositions, weights, and sub-agent calls.
+[lethes-observer](https://github.com/kb5000/lethes-observer) is a companion real-time dashboard that receives log events over HTTP and provides an in-browser view of pipeline runs, message dispositions, weights, and sub-agent calls.
 
 ```python
 from lethes import configure_logging
