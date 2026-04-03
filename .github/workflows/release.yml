@@ -11,6 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
+      - run: uv sync --extra dev
       - run: uv run pytest --tb=short -q
 
   publish:
