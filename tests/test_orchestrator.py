@@ -200,3 +200,73 @@ async def test_cost_none_without_pricing_table():
     orchestrator = ContextOrchestrator(budget=TokenBudget(max_tokens=1000))
     result = await orchestrator.process(conv, model_id="gpt-4o")
     assert result.estimated_cost_usd is None
+
+
+@pytest.mark.asyncio
+async def test_tool_pair_not_split_when_no_other_violations():
+    """Regression: repair() must always run, not only when constraint violations
+    exist.  Previously, if the greedy algorithm dropped one half of a tool
+    call/result pair but no *constraint* violation was detected (last-user kept,
+    min-messages satisfied), repair() was skipped and the split pair reached the
+    API causing an error."""
+    # Build a conversation where the tool result has high weight (kept) but
+    # the assistant tool_calls message has low weight (likely dropped on a
+    # tight budget).  We give the tool result a very high static weight so
+    # the greedy algorithm prefers it over the assistant message.
+    import dataclasses
+    from lethes.weighting.static import StaticWeightStrategy
+
+    raw = [
+        {"role": "user", "content": "please call the tool " + "word " * 10},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_xyz",
+                    "type": "function",
+                    "function": {"name": "do_thing", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_xyz",
+            "name": "do_thing",
+            "content": "done " + "word " * 10,
+        },
+        {"role": "user", "content": "thanks " + "word " * 5},
+    ]
+    conv = Conversation.from_openai_messages(raw)
+
+    # Give the tool result a higher weight than the assistant tool_calls message
+    # so greedy might prefer to keep one but drop the other.
+    msgs = list(conv.messages)
+    msgs[1] = dataclasses.replace(msgs[1], weight=0.1)   # assistant tool_calls — low
+    msgs[2] = dataclasses.replace(msgs[2], weight=0.9)   # tool result — high
+    conv = conv.with_messages(msgs)
+
+    # Budget tight enough to drop the low-weight assistant tool_calls message
+    # but keep both user messages and the high-weight tool result — without
+    # triggering any explicit constraint violation (last user is retained,
+    # min_chat_messages=1 is satisfied).  Tokens: user(14)+user(6)+tool(11)=31.
+    orchestrator = ContextOrchestrator(
+        budget=TokenBudget(max_tokens=31),
+        algorithm=GreedyByWeightAlgorithm(),
+        weighting=StaticWeightStrategy(),
+        cache=InMemoryCache(),
+        constraints=ConstraintSet(require_last_user=True, min_chat_messages=1),
+    )
+    result = await orchestrator.process(conv)
+    final_msgs = result.conversation.to_openai_messages()
+
+    # Verify tool pair integrity: if either half is present, both must be.
+    has_tool_call = any(
+        m.get("role") == "assistant" and m.get("tool_calls")
+        for m in final_msgs
+    )
+    has_tool_result = any(m.get("role") == "tool" for m in final_msgs)
+    assert has_tool_call == has_tool_result, (
+        "Tool call and tool result must both be present or both be absent; "
+        f"has_tool_call={has_tool_call}, has_tool_result={has_tool_result}"
+    )

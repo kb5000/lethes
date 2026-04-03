@@ -266,15 +266,15 @@ class ContextOrchestrator:
             estimated_tokens=selection.estimated_tokens,
         )
 
-        # Step 7: Constraint repair
+        # Step 7: Constraint repair (always run — also resolves tool-pair dependencies)
         violations = self._constraint_checker.validate(
             selection, conversation, self._constraints
         )
         if violations:
             log.warning("pipeline.constraint_repair", violations=len(violations))
-            selection = self._constraint_checker.repair(
-                selection, conversation, self._constraints
-            )
+        selection = self._constraint_checker.repair(
+            selection, conversation, self._constraints
+        )
 
         plan = ContextPlan.from_selection_result(
             selection,
