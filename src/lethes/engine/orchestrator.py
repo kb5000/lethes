@@ -41,8 +41,8 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-# Type alias for Open WebUI / generic event emitter
-EventEmitter = Callable[[dict[str, Any]], Awaitable[None]]
+# Generic status callback: (description, done) — framework-agnostic
+StatusCallback = Callable[[str, bool], Awaitable[None]]
 
 
 @dataclass
@@ -130,7 +130,7 @@ class ContextOrchestrator:
         conversation: Conversation,
         *,
         model_id: str | None = None,
-        event_emitter: EventEmitter | None = None,
+        status_callback: StatusCallback | None = None,
     ) -> OrchestratorResult:
         """
         Run the full orchestration pipeline.
@@ -187,10 +187,18 @@ class ContextOrchestrator:
         conversation = conversation.with_messages(messages_with_counts)
 
         pre_plan_tokens = sum(m.token_count or 0 for m in conversation.messages)
-        log.debug("pipeline.tokens", pre_plan_tokens=pre_plan_tokens, n_messages=len(conversation.messages))
+        n_messages = len(conversation.messages)
+        log.debug("pipeline.tokens", pre_plan_tokens=pre_plan_tokens, n_messages=n_messages)
         log.debug("pipeline.messages_in",
             messages=[_msg_summary(m) for m in conversation.messages],
         )
+
+        if status_callback:
+            await _emit_status(
+                status_callback,
+                f"Analysing context — {pre_plan_tokens} tokens, {n_messages} messages…",
+                done=False,
+            )
 
         # Check if budget is unlimited — skip selection
         if isinstance(budget, TokenBudget) and budget.max_tokens == 0:
@@ -214,15 +222,22 @@ class ContextOrchestrator:
             )
             return self._build_result(conversation, plan, session_flags, model_id, run_id=run_id)
 
-        # Step 5: Dynamic weighting — pass flag overrides in context
+        # Step 5: Dynamic weighting — skip if budget is not exceeded (nothing to trim)
         last_user = conversation.last_user_message()
         query = last_user.get_text_content() if last_user else ""
-        weighting_context = _build_weighting_context(effective)
-        scores = await self._weighting.score(
-            list(conversation.messages), query, conversation, context=weighting_context
-        )
-        weighted_messages = apply_scores(list(conversation.messages), scores)
-        conversation = conversation.with_messages(weighted_messages)
+        budget_exceeded = budget.is_exceeded(pre_plan_tokens, 0.0)
+        if budget_exceeded:
+            if status_callback:
+                await _emit_status(status_callback, "Scoring message relevance…", done=False)
+            weighting_context = _build_weighting_context(effective)
+            scores = await self._weighting.score(
+                list(conversation.messages), query, conversation, context=weighting_context
+            )
+            weighted_messages = apply_scores(list(conversation.messages), scores)
+            conversation = conversation.with_messages(weighted_messages)
+        else:
+            log.debug("pipeline.weighting_skipped", reason="budget_not_exceeded", pre_plan_tokens=pre_plan_tokens)
+            scores = {}
         if scores:
             vals = list(scores.values())
             log.debug("pipeline.weights",
@@ -269,16 +284,29 @@ class ContextOrchestrator:
         )
 
         # Emit status event
-        if event_emitter and plan.total_dropped > 0:
-            await _emit_status(
-                event_emitter,
-                f"Summarising {plan.total_dropped} messages, keeping {plan.total_kept}…",
-                done=False,
-            )
+        if status_callback:
+            if plan.total_dropped > 0:
+                await _emit_status(
+                    status_callback,
+                    f"Trimming context — keeping {plan.total_kept}, compressing {plan.total_dropped} messages…",
+                    done=False,
+                )
+            else:
+                await _emit_status(
+                    status_callback,
+                    f"Context OK — {plan.post_plan_tokens} tokens, {plan.total_kept} messages",
+                    done=True,
+                )
 
         # Step 8: Summarisation
         if not nosum and self._turn_summarizer and plan.summarize:
             log.debug("pipeline.summarize_start", n_messages=len(plan.summarize))
+            if status_callback:
+                await _emit_status(
+                    status_callback,
+                    f"Summarising {len(plan.summarize)} messages…",
+                    done=False,
+                )
             conversation = await self._execute_summarization(
                 conversation, plan, self._turn_summarizer
             )
@@ -301,11 +329,11 @@ class ContextOrchestrator:
         # Step 9: Assembly
         final_conversation = self._assemble(conversation, plan, nosum=nosum)
 
-        # Emit done event
-        if event_emitter and plan.total_dropped > 0:
+        # Emit done event (only needed when we emitted a non-done status above)
+        if status_callback and plan.total_dropped > 0:
             await _emit_status(
-                event_emitter,
-                f"Context ready: {plan.total_kept} messages kept, {plan.total_dropped} dropped.",
+                status_callback,
+                f"Context ready — {plan.total_kept} messages kept, {plan.total_dropped} compressed.",
                 done=True,
             )
 
@@ -567,8 +595,8 @@ class _TurnLimitBudget:
         return -1  # unlimited for the algorithm; turns enforced separately
 
 
-async def _emit_status(emitter: EventEmitter, description: str, done: bool) -> None:
+async def _emit_status(callback: StatusCallback, description: str, done: bool) -> None:
     try:
-        await emitter({"type": "status", "data": {"description": description, "done": done}})
+        await callback(description, done)
     except Exception:
         pass

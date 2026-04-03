@@ -296,11 +296,14 @@ class Filter:
 
         conversation = Conversation.from_openai_messages(messages)
 
+        async def _status_callback(description: str, done: bool) -> None:
+            await __event_emitter__({"type": "status", "data": {"description": description, "done": done}})
+
         pricing = await self._get_pricing_table()
         result = await self._get_orchestrator(pricing).process(
             conversation,
             model_id=self._model_id,
-            event_emitter=__event_emitter__,
+            status_callback=_status_callback,
         )
 
         final_msgs = result.conversation.to_openai_messages()

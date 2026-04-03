@@ -192,10 +192,13 @@ class OpenWebUIFilter:
         conversation = Conversation.from_openai_messages(messages)
         orchestrator = self._get_orchestrator()
 
+        async def _status_callback(description: str, done: bool) -> None:
+            await __event_emitter__({"type": "status", "data": {"description": description, "done": done}})
+
         result = await orchestrator.process(
             conversation,
             model_id=self._model_id,
-            event_emitter=__event_emitter__,
+            status_callback=_status_callback,
         )
 
         final_msgs = result.conversation.to_openai_messages()

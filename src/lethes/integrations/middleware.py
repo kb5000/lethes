@@ -49,7 +49,7 @@ class LethesMiddleware:
         *,
         model_id: str | None = None,
         session_id: str | None = None,
-        event_emitter: Any = None,
+        status_callback: Any = None,
     ) -> list[dict[str, Any]]:
         """
         Orchestrate *messages* and return the managed list.
@@ -62,15 +62,17 @@ class LethesMiddleware:
             Model identifier — used for cost estimation if a pricing table is configured.
         session_id:
             Override the session ID for prefix tracking.
-        event_emitter:
-            Optional status callback (Open WebUI or custom).
+        status_callback:
+            Optional async callable ``(description: str, done: bool) -> None`` for
+            progress reporting. Framework-agnostic — adapt to Open WebUI's event
+            emitter in your integration layer.
         """
         sid = session_id or self._session_id
         conversation = Conversation.from_openai_messages(messages, session_id=sid)
         result = await self._orchestrator.process(
             conversation,
             model_id=model_id,
-            event_emitter=event_emitter,
+            status_callback=status_callback,
         )
         return result.conversation.to_openai_messages()
 
