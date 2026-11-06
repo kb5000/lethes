@@ -1,6 +1,6 @@
 # 本地独立服务部署与持续开发
 
-本指南对应 `redesign/context-recall-v2` 分支。lethes 与原 lethes-observer
+本指南对应 `main` 主分支。lethes 与原 lethes-observer
 现在放在同一仓库，一个独立服务同时提供上下文 API 与观测 Web。
 Open WebUI 使用轻量 HTTP Filter 调用它，主模型仍由 Open WebUI 请求。
 
@@ -20,7 +20,7 @@ Open WebUI ── 完整当前历史 ──► lethes :8000 ──► SQLite /da
 lethes 或推理依赖。命令在仓库根目录、Bash/WSL 或类似终端中运行。
 
 ```bash
-git clone --branch redesign/context-recall-v2 --single-branch https://github.com/kb5000/lethes.git
+git clone --branch main --single-branch https://github.com/kb5000/lethes.git
 cd lethes
 python3 scripts/init_local.py
 ```
