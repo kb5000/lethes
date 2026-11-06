@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>lethes observer</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header>
+      <div>
+        <h1>lethes <span>observer</span></h1>
+        <p>上下文、原文召回与缓存周期</p>
+      </div>
+      <form id="connect">
+        <label
+          >服务 API Key
+          <input id="key" type="password" autocomplete="off" required /></label
+        ><button>连接</button><span id="connection" role="status">未连接</span>
+      </form>
+    </header>
+    <main>
+      <section class="overview" aria-label="最近请求统计">
+        <article>
+          <span>当前列表请求</span><strong id="requests">—</strong>
+        </article>
+        <article>
+          <span>有可信 usage 的请求</span><strong id="measured">—</strong>
+        </article>
+        <article>
+          <span>实际缓存读取 token</span><strong id="cache">—</strong>
+        </article>
+        <article>
+          <span>准备耗时中位数</span><strong id="latency">—</strong>
+        </article>
+      </section>
+      <div class="toolbar">
+        <h2>最近请求</h2>
+        <input
+          id="search"
+          placeholder="筛选模型、request_id、周期或重建原因"
+          aria-label="筛选请求"
+        /><button id="refresh">刷新</button>
+      </div>
+      <p class="note">
+        预算计数与返回 usage 分列。潜在公共前缀不代表实际缓存命中；无 usage
+        的请求可能未发送或被取消。数据每 2
+        秒刷新，刷新网页可载入开发中的新界面。
+      </p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>时间</th>
+              <th>模型 / request_id</th>
+              <th>提交时输入 / 上限</th>
+              <th>计数来源</th>
+              <th>本次实际输入</th>
+              <th>缓存读取</th>
+              <th>召回 / 未纳入</th>
+              <th>状态 / 周期</th>
+              <th>耗时</th>
+            </tr>
+          </thead>
+          <tbody id="rows">
+            <tr>
+              <td colspan="9">
+                输入 API Key 后连接。密钥仅保留在当前页面内存中。
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <section id="detail" hidden>
+        <div class="toolbar">
+          <h2>请求详情</h2>
+          <button id="close">关闭</button>
+        </div>
+        <p>
+          原文范围为消息索引，区间右端不包含。详情只展示计数、布局和版本标识，不返回聊天正文。
+        </p>
+        <pre id="detail-json"></pre>
+      </section>
+    </main>
+    <script src="app.js" defer></script>
+  </body>
+</html>

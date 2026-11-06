@@ -3,6 +3,19 @@
 面向 Open WebUI 长聊天，尤其是小说和角色扮演的原文召回与上下文组装库。
 这是一次不兼容 v1 的重写。
 
+**[本地部署与持续开发完整文档](docs/deployment-cn.md)**：lethes 与 lethes-observer
+现已合在本仓库，一个独立服务同时提供上下文 API 和观测 Web，配套 Docker Compose。
+开发模式挂载源码，Python 自动重载，Web 修改后刷新浏览器即可。
+Open WebUI 使用 `src/external/open_webui_service_filter.py` 通过 HTTP 接入。
+
+```bash
+python3 scripts/init_local.py
+docker compose -f compose.yaml -f compose.dev.yaml up -d --build
+```
+
+打开 `http://127.0.0.1:8000/`，输入 `.env` 中生成的 API Key。容量、计数器和检索模型
+统一配置在 `deploy/lethes.local.json`，无需将 lethes 本体装进 Open WebUI 容器。
+
 每轮以 Open WebUI 传入的完整当前历史为依据：保留近期连续原文，召回较早
 原文片段，作为历史 reminder 补入上下文。系统不抽取世界规则，不维护角色事实，
 也不反复生成滚动摘要。
@@ -20,13 +33,13 @@
 ## 开发与测试
 
 ```bash
-uv sync --extra dev
+uv sync --extra dev --extra server
 uv run pytest
 uv run python examples/replay.py --synthetic-turns 300 --output /tmp/lethes-replay.csv
 uv build
 ```
 
-## Open WebUI 安装
+## 作为库嵌入 Open WebUI（可选）
 
 先把构建的 `dist/lethes-2.0.0a1-py3-none-any.whl` 安装到 **Open WebUI 后端环境**，
 再把 `src/external/open_webui_filter.py` 导入管理后台 Functions，启用、绑定模型并在聊天中选中。

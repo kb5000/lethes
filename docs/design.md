@@ -123,6 +123,14 @@ disabled until configured. Capacity/validity handling remains active.
 
 ## Measurement and integration limits
 
+The independent HTTP service hosts the observer in the same package/image. The
+Open WebUI service Filter forwards complete current paths and per-provider usage;
+the service owns counting, retrieval, layout persistence and dispatch observations.
+The observer reads the same SQLite ledger through authenticated summary/detail
+routes; there is no lossy in-memory log-ingestion dependency. Observer responses
+exclude original message payloads and raw provider fields. Existing embedded
+integration remains an alternative, sharing observation/status serialization.
+
 `potential_cached_tokens` is a conservative message-boundary prefix estimate,
 never a claim that a request reached the provider or that a cache is resident.
 It can miss partial-message matches and provider-added prefixes. Attempts without

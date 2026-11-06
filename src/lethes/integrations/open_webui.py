@@ -11,13 +11,13 @@ import json
 import logging
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import asdict
 
 from pydantic import BaseModel, Field, SecretStr
 
 from lethes.costs import CachePricing
 from lethes.engine import ContextConfig, ContextManager
 from lethes.history import canonical, digest, normalize
+from lethes.observability import context_observation, status_line
 from lethes.providers import OpenAIEmbeddings, OpenAIQueryExpander
 from lethes.retrieval import HybridRetriever
 from lethes.store import SQLiteStore
@@ -41,40 +41,6 @@ def instruction_count(messages: list[dict]) -> int:
             break
         count += 1
     return count
-
-
-def status_line(observation: dict) -> str:
-    sources = {
-        "reported_usage": "历史实测",
-        "reported_prefix_plus_estimate": "实测+估算",
-        "usage_calibrated_estimate": "校准估算",
-        "local_estimate": "估算",
-        "provider_usage": "本次实测",
-    }
-    reasons = {
-        "initial": "初建",
-        "append": "续接",
-        "replay": "复用",
-        "capacity": "容量重建",
-        "recall_capacity": "召回重建",
-        "economic": "经济重建",
-        "count_capacity": "计数修复",
-    }
-    source = observation["count_source"]
-    approximate = "" if source in {"reported_usage", "provider_usage"} else "≈"
-    line = (
-        f"lethes · 输入 {approximate}{observation['input_tokens']:,}"
-        f"/{observation['input_limit']:,} token（{sources.get(source, '估算')}）"
-        f" · {reasons.get(observation['reason'], '就绪')}"
-        f" · 召回 {observation['recalled_messages']}"
-    )
-    if observation.get("cached_tokens") is not None:
-        line += f" · 缓存读 {observation['cached_tokens']:,}"
-    if observation["omitted_messages"]:
-        line += f" · 未纳入 {observation['omitted_messages']}"
-    if observation["warnings"]:
-        line += f" · 检索降级 {len(observation['warnings'])}"
-    return line
 
 
 class OpenWebUIFilter:
@@ -332,24 +298,12 @@ class OpenWebUIFilter:
             request_context=token_context,
             correlation=correlation,
         )
-        observation = {
-            "request_id": result.request_id,
-            "model": body.get("model"),
-            "epoch": result.snapshot.epoch,
-            "reason": result.reason,
-            "input_tokens": result.input_tokens,
-            "input_limit": manager.config.input_limit
-            - max(0, reply - manager.config.reply_reserve),
-            "count_source": result.count_source,
-            "count_reference": result.count_reference,
-            "potential_cached_tokens": result.potential_cached_tokens,
-            "recalled_messages": len({i for s in result.recalled for i in s.indices()}),
-            "omitted_messages": len({i for s in result.omitted for i in s.indices()}),
-            "omitted": [asdict(s) for s in result.omitted],
-            "warnings": list(result.warnings),
-            "economics": result.economics,
-            "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
-        }
+        observation = context_observation(
+            result,
+            body.get("model"),
+            manager.config.input_limit - max(0, reply - manager.config.reply_reserve),
+            (time.perf_counter() - started) * 1000,
+        )
         manager.store.record_observation(result.request_id, observation)
         context.update(
             {

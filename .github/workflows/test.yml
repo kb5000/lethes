@@ -11,12 +11,20 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: ${{ matrix.python }}
-      - run: uv sync --extra dev --locked
-      - run: uv run ruff check src tests examples
-      - run: uv run ruff format --check src tests examples
+      - run: uv sync --extra dev --extra server --locked
+      - run: uv run ruff check src tests examples scripts
+      - run: uv run ruff format --check src tests examples scripts
       - run: uv run mypy src/lethes --ignore-missing-imports
       - run: uv run pytest --cov=lethes --cov-fail-under=85
       - run: uv build
+      - name: Validate local deployment
+        if: matrix.python == '3.12'
+        env:
+          LETHES_API_KEY: ci-validation-only-not-a-real-secret
+        run: |
+          docker compose config --quiet
+          docker compose -f compose.yaml -f compose.dev.yaml --profile semantic config --quiet
+          node --check src/lethes/observer/app.js
   litellm:
     runs-on: ubuntu-latest
     env:
@@ -26,5 +34,5 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: '3.12'
-      - run: uv sync --extra dev --extra litellm --locked
-      - run: uv run --extra dev --extra litellm pytest tests/test_litellm_sdk.py tests/test_token_counts.py -q
+      - run: uv sync --extra dev --extra litellm --extra server --locked
+      - run: uv run --extra dev --extra litellm --extra server pytest tests/test_litellm_sdk.py tests/test_token_counts.py tests/test_service.py -q

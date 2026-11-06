@@ -1,0 +1,41 @@
+name: lethes-local
+services:
+  lethes:
+    build: .
+    image: lethes-local:dev
+    restart: unless-stopped
+    environment:
+      LETHES_API_KEY: ${LETHES_API_KEY:?Set LETHES_API_KEY in .env}
+      LETHES_CONFIG_PATH: /app/config/lethes.local.json
+      LETHES_STATE_PATH: /data/lethes.sqlite3
+      LITELLM_LOCAL_MODEL_COST_MAP: "True"
+      NO_PROXY: "${NO_PROXY:-localhost,127.0.0.1},localhost,127.0.0.1,lethes,embedding"
+      no_proxy: "${NO_PROXY:-localhost,127.0.0.1},localhost,127.0.0.1,lethes,embedding"
+    ports:
+      - "127.0.0.1:${LETHES_PORT:-8000}:8000"
+    volumes:
+      - lethes-data:/data
+      - ./deploy:/app/config:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+  embedding:
+    profiles: [semantic]
+    image: ${LETHES_EMBEDDING_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:cpu-1.9}
+    restart: unless-stopped
+    command: ["--model-id", "BAAI/bge-small-zh-v1.5", "--served-model-name", "BAAI/bge-small-zh-v1.5", "--dtype", "float32", "--pooling", "cls"]
+    environment:
+      AUTO_TRUNCATE: "false"
+    volumes:
+      - embedding-data:/data
+    ports:
+      - "127.0.0.1:${LETHES_EMBEDDING_PORT:-8081}:80"
+volumes:
+  lethes-data:
+  embedding-data:
+networks:
+  default:
+    name: ${LETHES_NETWORK:-lethes-local}

@@ -26,6 +26,12 @@ candidates. It must not rewrite reminders already present in a valid prefix.
 
 ## Endpoint configuration
 
+For the standalone service, use `defaults.retrieval` or a per-model override in
+`deploy/lethes.local.json`; the bundled Compose `semantic` profile starts the CPU
+encoder. See the [deployment guide](deployment-cn.md). The configuration below
+describes the optional embedded Filter Valves; the service nests its endpoint
+under `retrieval.embedding` and retains the window/prefix options in `retrieval`.
+
 Run the encoder as a separate local service exposing OpenAI-compatible
 `POST /v1/embeddings`; no inference framework is added to Open WebUI's process.
 [TEI's official guide](https://huggingface.co/docs/text-embeddings-inference/quick_tour)

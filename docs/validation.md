@@ -2,8 +2,11 @@
 
 ## Automated checks
 
-- 133 tests pass on Python 3.12 with the LiteLLM extra; core coverage 94.41%.
-  Without that extra, 131 pass and the two real-SDK checks are skipped.
+- 151 tests pass on Python 3.12 with server and LiteLLM extras; core coverage 94.92%.
+  With server but without LiteLLM, 148 pass and three SDK-dependent tests skip
+  (94.92% coverage).
+  CI runs server tests on Python 3.11/3.12/3.13 and SDK contracts
+  separately.
 - Ruff lint/format and mypy pass.
 - Source distribution and wheel build; installation is checked in a separate
   environment. CI tests Python 3.11/3.12/3.13 and has a separate real LiteLLM SDK
@@ -29,6 +32,29 @@
   original-message identity, no per-window vote inflation, query/document prefixes,
   window cache reuse and invalid configuration. No small-model weights were run;
   pretrained recall quality and inference latency remain unmeasured.
+
+## Independent service and unified observer
+
+- HTTP contract tests cover bearer authorization, bounded read-only observations,
+  original/raw-field exclusion, prepare/usage/replay, restart, model overrides,
+  envelopes and reply reservations, edits/restore, malformed inputs, aggregate
+  usage, provider priority, counter switches and actual model-mapping isolation.
+  The standalone Open WebUI Filter is exercised
+  against the ASGI service with tool-hop rehydration and usage callbacks.
+- A native Uvicorn process was started locally. Actual HTTP prepare, synthetic
+  provider usage and observer reads passed. Editing Python triggered reload;
+  editing JSON config changed the effective input limit. Measurements and the
+  immutable dispatch observation survived both reloads.
+- Chromium/Playwright verified observer authentication, live polling, measured
+  counters, filtering with matching overview statistics, request details, safe
+  rendering of model IDs containing markup, no original text in the page,
+  no external CDN requests and no key in browser storage or URLs.
+- Base/development/semantic Compose configuration validates; observer JavaScript
+  syntax validates. Local configuration initialization preserves existing secrets.
+  Built wheels include the API and all three observer assets.
+- This environment cannot access the Docker daemon, so Docker image build,
+  container startup and actual TEI model loading were not executed. Native HTTP
+  and hot-reload checks do not establish container-runtime compatibility.
 
 ## Supplied workloads
 

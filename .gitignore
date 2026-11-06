@@ -35,3 +35,6 @@ htmlcov/
 *.sqlite3-shm
 *.sqlite3-wal
 .ruff_cache/
+.env
+deploy/lethes.local.json
+backups/

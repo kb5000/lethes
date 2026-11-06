@@ -3,6 +3,12 @@
 Original-text recall and cache-stable context for long Open WebUI conversations,
 including fiction and roleplay. This is a breaking rewrite of v1.
 
+**Local deployment:** [complete deployment and development guide](docs/deployment-cn.md).
+The standalone service and **lethes-observer Web UI now live in this repository**,
+ship in one image and share persistent SQLite observations. Development Compose
+mounts source code for backend reload and browser refresh; no separate observer
+checkout is needed.
+
 lethes receives the complete current history on every request. It keeps recent
 conversation verbatim, retrieves earlier original passages, and inserts them as
 historical reminders. It does **not** extract or maintain fictional rules, facts,
@@ -34,10 +40,34 @@ character state, or a rolling summary.
   an estimated increment. Count provenance, potential reusable prefixes and
   actual provider cache usage remain distinct.
 
-## Install and run
+## Standalone service and observer
 
 ```bash
-uv sync --extra dev
+python3 scripts/init_local.py
+docker compose -f compose.yaml -f compose.dev.yaml up -d --build
+```
+
+Open `http://127.0.0.1:8000/` and enter the generated `.env` API key. The observer
+reads persisted dispatch observations and provider usage, including count sources,
+recall ranges, reminder anchors, cache-cycle reasons and latency. It has no CDN
+dependency and does not send original chat text to the browser.
+
+Install [`open_webui_service_filter.py`](src/external/open_webui_service_filter.py)
+in Open WebUI Functions, set `service_url` and `service_api_key`, and attach the
+function to the target chat model. It requires only httpx/pydantic in Open WebUI;
+all context/tokenizer/helper configuration lives at the service. The
+[deployment guide](docs/deployment-cn.md) covers shared Docker networks, per-model
+configuration, optional CPU embeddings, hot reload, API contracts and backups.
+
+The service provides authenticated `/v2/context/prepare`, `/v2/usage` and
+`/v2/observations` routes, `/healthz`, `/docs`, and the same-origin `/observer/`.
+It prepares context; the host still makes the main-model request and reports usage.
+The original package/embedded Filter remains available below.
+
+## Library installation and tests
+
+```bash
+uv sync --extra dev --extra server
 uv run pytest
 uv run python examples/replay.py --synthetic-turns 300 --output /tmp/lethes-replay.csv
 ```
@@ -90,7 +120,7 @@ Configure `CachePricing(uncached_per_million=..., cached_per_million=...)` to en
 economic rebuilds. Without prices, valid prefixes are reused until capacity
 requires rebuilding. Prices are explicit; there is no guessed model-price table.
 
-## Open WebUI
+## Embedded Open WebUI Filter
 
 Build and install this checkout into the **Open WebUI backend environment**:
 

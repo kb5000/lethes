@@ -1,0 +1,16 @@
+{
+  "defaults": {
+    "context": {
+      "context_window": 32768,
+      "reply_reserve": 4096,
+      "safety_reserve": 1024,
+      "recent_tokens": 8192,
+      "minimum_recent_turns": 2,
+      "rebuild_fill": 0.75
+    },
+    "tokenizer": "bytes",
+    "pricing": null,
+    "retrieval": {}
+  },
+  "models": {}
+}

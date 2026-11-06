@@ -314,6 +314,53 @@ class SQLiteStore:
             ).fetchone()
         return json.loads(row[0]) if row else None
 
+    def observations(self, limit: int = 100, request_id: str | None = None) -> list[dict]:
+        """Bounded observer read model; excludes message payloads and raw provider fields."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT a.created,a.scope,o.payload,a.usage FROM attempts a "
+                "JOIN attempt_observations o ON a.id=o.id "
+                "WHERE (? IS NULL OR a.id=?) ORDER BY a.created DESC,a.id DESC LIMIT ?",
+                (request_id, request_id, max(1, min(limit, 200))),
+            ).fetchall()
+        result = []
+        for created, scope, payload, saved in rows:
+            usage = json.loads(saved) if saved else None
+            eligible = bool(usage and self.authoritative_usage(usage))
+            visible = (
+                {
+                    k: v
+                    for k, v in usage.items()
+                    if k
+                    in {
+                        "input_tokens",
+                        "output_tokens",
+                        "cached_tokens",
+                        "aggregate",
+                        "measurement_eligible",
+                        "reported_model",
+                        "usage_origin",
+                    }
+                }
+                if usage
+                else None
+            )
+            if visible:
+                for name in ("input_tokens", "output_tokens", "cached_tokens"):
+                    value = visible.get(name)
+                    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                        visible.pop(name, None)
+            result.append(
+                {
+                    "created": created,
+                    "scope": scope,
+                    "observation": json.loads(payload),
+                    "usage": visible,
+                    "authoritative": eligible,
+                }
+            )
+        return result
+
     def correlated_request(self, correlation: str) -> str | None:
         if not correlation:
             return None

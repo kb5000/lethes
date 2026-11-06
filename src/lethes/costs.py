@@ -121,6 +121,8 @@ def parse_usage(usage: dict) -> dict:
             + usage.get("cache_creation_input_tokens", 0)
         )
     details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details") or {}
+    if not isinstance(details, dict):
+        details = {}
     cached = details.get("cached_tokens", usage.get("cache_read_input_tokens"))
     if cached is not None:
         result["cached_tokens"] = cached
