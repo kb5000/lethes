@@ -38,6 +38,9 @@ class SQLiteStore:
                 id TEXT PRIMARY KEY, models TEXT NOT NULL,
                 measurement_domain TEXT NOT NULL DEFAULT ''
             );
+            CREATE TABLE IF NOT EXISTS attempt_observations (
+                id TEXT PRIMARY KEY, payload TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS token_measurements (
                 scope TEXT NOT NULL, domain TEXT NOT NULL, wire_hash TEXT NOT NULL,
                 wire TEXT NOT NULL, tokens INTEGER NOT NULL, request_id TEXT NOT NULL,
@@ -169,7 +172,7 @@ class SQLiteStore:
         return [json.loads(row[0]) for row in rows]
 
     @staticmethod
-    def _authoritative(usage: dict) -> bool:
+    def authoritative_usage(usage: dict) -> bool:
         tokens = usage.get("input_tokens")
         raw = usage.get("raw", {})
         source = raw.get("litellm_count_source", raw.get("source"))
@@ -220,7 +223,7 @@ class SQLiteStore:
         ).fetchone()
         if barrier and created <= barrier[0]:
             return
-        if self._authoritative(usage):
+        if self.authoritative_usage(usage):
             self._db.execute(
                 "INSERT INTO token_measurements VALUES (?,?,?,?,?,?,?) "
                 "ON CONFLICT(scope,domain,wire_hash) DO UPDATE SET wire=excluded.wire, "
@@ -296,6 +299,21 @@ class SQLiteStore:
             ).fetchone()
         return json.loads(row[0]) if row and row[0] else None
 
+    def record_observation(self, request_id: str, observation: dict) -> None:
+        """Keep dispatch-time counts even after later usage changes calibration."""
+        with self._lock, self._db:
+            self._db.execute(
+                "INSERT OR IGNORE INTO attempt_observations SELECT id,? FROM attempts WHERE id=?",
+                (canonical(observation), request_id),
+            )
+
+    def observation(self, request_id: str) -> dict | None:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT payload FROM attempt_observations WHERE id=?", (request_id,)
+            ).fetchone()
+        return json.loads(row[0]) if row else None
+
     def correlated_request(self, correlation: str) -> str | None:
         if not correlation:
             return None
@@ -319,6 +337,11 @@ class SQLiteStore:
 
     def delete_scope(self, scope: str) -> None:
         with self._lock, self._db:
+            self._db.execute(
+                "DELETE FROM attempt_observations WHERE id IN "
+                "(SELECT id FROM attempts WHERE scope=?)",
+                (scope,),
+            )
             self._db.execute(
                 "DELETE FROM attempt_models WHERE id IN (SELECT id FROM attempts WHERE scope=?)",
                 (scope,),

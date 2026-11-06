@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict
 
@@ -42,6 +43,40 @@ def instruction_count(messages: list[dict]) -> int:
     return count
 
 
+def status_line(observation: dict) -> str:
+    sources = {
+        "reported_usage": "历史实测",
+        "reported_prefix_plus_estimate": "实测+估算",
+        "usage_calibrated_estimate": "校准估算",
+        "local_estimate": "估算",
+        "provider_usage": "本次实测",
+    }
+    reasons = {
+        "initial": "初建",
+        "append": "续接",
+        "replay": "复用",
+        "capacity": "容量重建",
+        "recall_capacity": "召回重建",
+        "economic": "经济重建",
+        "count_capacity": "计数修复",
+    }
+    source = observation["count_source"]
+    approximate = "" if source in {"reported_usage", "provider_usage"} else "≈"
+    line = (
+        f"lethes · 输入 {approximate}{observation['input_tokens']:,}"
+        f"/{observation['input_limit']:,} token（{sources.get(source, '估算')}）"
+        f" · {reasons.get(observation['reason'], '就绪')}"
+        f" · 召回 {observation['recalled_messages']}"
+    )
+    if observation.get("cached_tokens") is not None:
+        line += f" · 缓存读 {observation['cached_tokens']:,}"
+    if observation["omitted_messages"]:
+        line += f" · 未纳入 {observation['omitted_messages']}"
+    if observation["warnings"]:
+        line += f" · 检索降级 {len(observation['warnings'])}"
+    return line
+
+
 class OpenWebUIFilter:
     class Valves(BaseModel):
         priority: int = Field(default=100, description="Run after other context-changing filters")
@@ -58,6 +93,7 @@ class OpenWebUIFilter:
         tokenizer_model: str = Field(
             default="", description="Actual LiteLLM model; defaults to workspace base_model_id"
         )
+        show_status: bool = Field(default=True, description="Compact token status in chat")
         input_price: float | None = Field(default=None, ge=0, description="USD per million tokens")
         cached_input_price: float | None = Field(default=None, ge=0)
         cache_minimum: int = Field(default=1024, ge=0)
@@ -66,6 +102,11 @@ class OpenWebUIFilter:
         embedding_api_base: str = "https://api.openai.com/v1"
         embedding_api_key: SecretStr = SecretStr("")
         embedding_model: str = ""
+        embedding_chunk_chars: int = Field(default=0, ge=0, description="0 disables windowing")
+        embedding_chunk_overlap: int = Field(default=64, ge=0)
+        embedding_query_prefix: str = ""
+        embedding_document_prefix: str = ""
+        semantic_floor: float = Field(default=0.25, ge=-1, le=1)
         query_api_base: str = "https://api.openai.com/v1"
         query_api_key: SecretStr = SecretStr("")
         query_model: str = ""
@@ -78,6 +119,16 @@ class OpenWebUIFilter:
 
     def _get_manager(self) -> ContextManager:
         config = self.valves.model_dump(mode="json")
+        config.pop("show_status")  # Presentation changes must not invalidate a model prefix.
+        for name, default in {
+            "embedding_chunk_chars": 0,
+            "embedding_chunk_overlap": 64,
+            "embedding_query_prefix": "",
+            "embedding_document_prefix": "",
+            "semantic_floor": 0.25,
+        }.items():
+            if config[name] == default:
+                config.pop(name)  # Preserve existing domains with default helper behavior.
         # SecretStr serialization masks values; hash actual secrets for invalidation, never log.
         config["embedding_api_key"] = digest(self.valves.embedding_api_key.get_secret_value())
         config["query_api_key"] = digest(self.valves.query_api_key.get_secret_value())
@@ -120,7 +171,15 @@ class OpenWebUIFilter:
                 rebuild_fill=valves.rebuild_fill,
             ),
             store=SQLiteStore(valves.state_path),
-            retriever=HybridRetriever(embedder=embedder, expander=expander),
+            retriever=HybridRetriever(
+                embedder=embedder,
+                expander=expander,
+                semantic_floor=valves.semantic_floor,
+                embedding_chunk_chars=valves.embedding_chunk_chars,
+                embedding_chunk_overlap=valves.embedding_chunk_overlap,
+                embedding_query_prefix=valves.embedding_query_prefix,
+                embedding_document_prefix=valves.embedding_document_prefix,
+            ),
             pricing=pricing,
             counter=ByteTokenCounter()
             if valves.tokenizer in {"bytes", "litellm"}
@@ -177,6 +236,7 @@ class OpenWebUIFilter:
         __task__: str | None = None,
         __id__: str | None = None,
     ) -> dict:
+        started = time.perf_counter()
         metadata = self._metadata(body, __metadata__)
         key = self._key(__id__)
         context = metadata.setdefault(key, {})
@@ -272,6 +332,25 @@ class OpenWebUIFilter:
             request_context=token_context,
             correlation=correlation,
         )
+        observation = {
+            "request_id": result.request_id,
+            "model": body.get("model"),
+            "epoch": result.snapshot.epoch,
+            "reason": result.reason,
+            "input_tokens": result.input_tokens,
+            "input_limit": manager.config.input_limit
+            - max(0, reply - manager.config.reply_reserve),
+            "count_source": result.count_source,
+            "count_reference": result.count_reference,
+            "potential_cached_tokens": result.potential_cached_tokens,
+            "recalled_messages": len({i for s in result.recalled for i in s.indices()}),
+            "omitted_messages": len({i for s in result.omitted for i in s.indices()}),
+            "omitted": [asdict(s) for s in result.omitted],
+            "warnings": list(result.warnings),
+            "economics": result.economics,
+            "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
+        }
+        manager.store.record_observation(result.request_id, observation)
         context.update(
             {
                 "source": incoming,
@@ -281,40 +360,78 @@ class OpenWebUIFilter:
                 "state_path": self.valves.state_path,
                 "provider_hops": context.get("provider_hops", 0) + 1,
                 "response_model": None,
+                "status_usage": None,
             }
         )
         body["messages"] = result.messages
-        log.info(
-            "lethes.context",
-            extra={
-                "lethes": {
-                    "request_id": result.request_id,
-                    "reason": result.reason,
-                    "estimated_tokens": result.estimated_tokens,
-                    "count_source": result.count_source,
-                    "count_reference": result.count_reference,
-                    "potential_cached_tokens": result.potential_cached_tokens,
-                    "omitted": [asdict(s) for s in result.omitted],
-                    "warnings": result.warnings,
-                    "economics": result.economics,
-                }
-            },
-        )
-        if __event_emitter__:
-            await __event_emitter__(
+        log.info("lethes.context %s", canonical(observation), extra={"lethes": observation})
+        await self._emit_status(observation, __event_emitter__)
+        return body
+
+    async def _emit_status(self, observation: dict, emitter: Emitter | None) -> None:
+        if not emitter or not self.valves.show_status:
+            return
+        try:
+            await emitter(
                 {
                     "type": "status",
                     "data": {
-                        "description": "Historical context ready",
+                        "description": status_line(observation),
                         "done": True,
+                        "hidden": False,
                         "action": "lethes.context",
                     },
                 }
             )
-        return body
+        except Exception as exc:
+            log.warning(
+                "lethes.status_failed request_id=%s error=%s",
+                observation["request_id"],
+                type(exc).__name__,
+            )
+
+    async def _usage_status(
+        self, context: dict, recorded: tuple[dict, dict | None] | None, emitter: Emitter | None
+    ) -> None:
+        if not recorded:
+            return
+        usage, observation = recorded
+        details = {
+            "request_id": observation["request_id"] if observation else context.get("request_id"),
+            "usage_origin": usage.get("usage_origin"),
+            "aggregate": usage.get("aggregate", False),
+            "measurement_eligible": SQLiteStore.authoritative_usage(usage),
+            "reported_model": usage.get("reported_model"),
+        }
+        for name in ("input_tokens", "cached_tokens", "output_tokens"):
+            value = usage.get(name)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                details[name] = value
+        log.info("lethes.usage %s", canonical(details), extra={"lethes": details})
+        if not observation or not SQLiteStore.authoritative_usage(usage):
+            return
+        signature = digest(
+            [observation["request_id"], usage["input_tokens"], details.get("cached_tokens")]
+        )
+        if context.get("status_usage") == signature:
+            return
+        await self._emit_status(
+            {
+                **observation,
+                "input_tokens": usage["input_tokens"],
+                "count_source": "provider_usage",
+                "cached_tokens": details.get("cached_tokens"),
+            },
+            emitter,
+        )
+        context["status_usage"] = signature
 
     async def stream(
-        self, event: dict, __metadata__: dict | None = None, __id__: str | None = None
+        self,
+        event: dict,
+        __metadata__: dict | None = None,
+        __id__: str | None = None,
+        __event_emitter__: Emitter | None = None,
     ) -> dict:
         context = (__metadata__ or {}).get(self._key(__id__), {})
         data = event.get("data")
@@ -334,12 +451,13 @@ class OpenWebUIFilter:
         if not usage and isinstance(message, dict):
             usage = message.get("usage")
         if isinstance(usage, dict) and context.get("request_id"):
-            self._record_usage(
+            recorded = self._record_usage(
                 context,
                 context["request_id"],
                 usage,
                 context.get("response_model"),
             )
+            await self._usage_status(context, recorded, __event_emitter__)
         return event
 
     def _record_usage(
@@ -349,10 +467,9 @@ class OpenWebUIFilter:
         usage: dict,
         model: str | None = None,
         origin: str = "provider_stream",
-    ) -> None:
-        path = context.get("state_path", self.valves.state_path)
-        if path == self.valves.state_path:
-            manager = self._get_manager()
+    ) -> tuple[dict, dict | None] | None:
+        def record(manager: ContextManager) -> tuple[dict, dict | None] | None:
+            previous = manager.store.usage(request_id)
             manager.record_usage(
                 request_id,
                 usage,
@@ -364,20 +481,19 @@ class OpenWebUIFilter:
                     or manager.store.turn_attempts(request_id) > 1
                 ),
             )
+            saved = manager.store.usage(request_id)
+            if not saved or saved == previous:
+                return None
+            return saved, manager.store.observation(request_id)
+
+        path = context.get("state_path", self.valves.state_path)
+        if path == self.valves.state_path:
+            return record(self._get_manager())
         else:
             # A valve change must not redirect an in-flight response to a different database.
             store = SQLiteStore(path)
             try:
-                ContextManager(store=store).record_usage(
-                    request_id,
-                    usage,
-                    model=model,
-                    origin=origin,
-                    aggregate=origin == "outlet"
-                    and (
-                        context.get("provider_hops", 1) > 1 or store.turn_attempts(request_id) > 1
-                    ),
-                )
+                return record(ContextManager(store=store))
             finally:
                 store.close()
 
@@ -387,6 +503,7 @@ class OpenWebUIFilter:
         __metadata__: dict | None = None,
         __user__: dict | None = None,
         __id__: str | None = None,
+        __event_emitter__: Emitter | None = None,
     ) -> dict:
         metadata = __metadata__ or {}
         context = metadata.get(self._key(__id__), {})
@@ -400,11 +517,12 @@ class OpenWebUIFilter:
             )
             if request_id:
                 reported = body.get("model")
-                self._record_usage(
+                recorded = self._record_usage(
                     context,
                     request_id,
                     usage,
                     reported if isinstance(reported, str) else None,
                     origin="outlet",
                 )
+                await self._usage_status(context, recorded, __event_emitter__)
         return body

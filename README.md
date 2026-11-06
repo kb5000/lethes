@@ -138,6 +138,37 @@ Output tokens are excluded from input counts; reply capacity is reserved separat
 Missing emitters and fresh completed-callback metadata are handled.
 Unscoped API calls without a user and chat identity pass through unchanged.
 
+Each provider hop emits a compact status, for example:
+
+```text
+lethes · 输入 ≈12,340/27,648 token（估算） · 续接 · 召回 4
+```
+
+The denominator is the available input budget after reply/safety reservations.
+`≈` marks estimated or hybrid counts; matching historical counts are labelled
+`历史实测`. When authoritative per-request usage arrives, the status updates to
+`本次实测`, with cache reads if reported. Invalid/estimated usage and multi-hop
+aggregates cannot masquerade as measured input. Recall counts include all original
+messages quoted in the current layout, including resident reminders. Open WebUI controls status-history
+folding; the Filter emits one-line descriptions using its native status UI and
+does not insert telemetry into model messages or generated prose. Set
+`show_status=false` to hide these events without resetting the context cycle.
+
+`lethes.context` and `lethes.usage` INFO logs contain single-line JSON plus a
+structured `lethes` field: request ID, epoch/rebuild reason, dispatch count and
+provenance, input limit, recall/omission counts, potential prefix reuse and
+assembly latency. Usage logs separately report provider input/output/cache counts
+and whether the measurement is eligible or aggregated. Enable INFO for
+`lethes.integrations.open_webui` in the host logging configuration. Chat text,
+queries, vectors and API keys are excluded from these log records. Dispatch
+observations remain available through `store.observation(request_id)`, separately
+from `store.usage(request_id)`, including after restart.
+
+For small local semantic encoders, configure `embedding_api_base` to your local
+OpenAI-compatible service. Optional query/document prefixes, overlapping character
+windows and `semantic_floor` adapt short-context encoders without changing original
+citations. See [local model choices and configuration](docs/local-models.md).
+
 This targets Open WebUI versions with the documented `request()` hook. The official
 [Filter guide](https://docs.openwebui.com/features/extensibility/plugin/functions/filter/)
 and [reserved arguments](https://docs.openwebui.com/features/extensibility/plugin/development/reserved-args/)

@@ -2,8 +2,8 @@
 
 ## Automated checks
 
-- 115 tests pass on Python 3.12 with the LiteLLM extra; core coverage 94.15%.
-  Without that extra, 113 pass and the two real-SDK checks are skipped.
+- 133 tests pass on Python 3.12 with the LiteLLM extra; core coverage 94.41%.
+  Without that extra, 131 pass and the two real-SDK checks are skipped.
 - Ruff lint/format and mypy pass.
 - Source distribution and wheel build; installation is checked in a separate
   environment. CI tests Python 3.11/3.12/3.13 and has a separate real LiteLLM SDK
@@ -21,6 +21,14 @@
 - LiteLLM 1.108.1 is exercised locally with its bundled model registry, Chinese
   text, tool schemas and OpenAI/Azure model prefixes. No API key or completion is
   used; fake SDK tests separately verify request isolation and adapter arguments.
+- Observability tests cover effective input budgets, estimated-to-measured status
+  updates, duplicate/output-only usage, unreliable and aggregate usage, persistent
+  dispatch observations, fresh callbacks after restart, scope deletion, disabled
+  status preserving prefixes, and disconnected emitters. Logs exclude chat text.
+- Controlled encoder tests cover overlapping windows reaching late original text,
+  original-message identity, no per-window vote inflation, query/document prefixes,
+  window cache reuse and invalid configuration. No small-model weights were run;
+  pretrained recall quality and inference latency remain unmeasured.
 
 ## Supplied workloads
 

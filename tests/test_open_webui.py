@@ -6,6 +6,7 @@ import pytest
 from conftest import ScriptedRetriever, story
 
 from lethes import Span
+from lethes.history import digest
 from lethes.integrations.open_webui import OpenWebUIFilter
 
 
@@ -256,3 +257,156 @@ async def test_aggregated_outlet_after_tool_hops_is_not_a_prompt_measurement(ada
     replay_body = {"model": "m", "messages": [{"role": "user", "content": "hello"}]}
     await adapter.request(replay_body, __metadata__=replay_meta)
     assert replay_body["messages"] == [{"role": "user", "content": "hello"}]
+
+
+async def test_compact_status_persists_dispatch_budget_and_updates_to_actual_usage(adapter, caplog):
+    caplog.set_level("INFO", logger="lethes.integrations.open_webui")
+    metadata = meta()
+    events = []
+
+    async def emit(event):
+        events.append(event)
+
+    body = {"model": "m", "messages": story(), "max_tokens": 900}
+    await adapter.request(body, __metadata__=metadata, __event_emitter__=emit)
+    compiled = copy.deepcopy(body["messages"])
+    request_id = metadata[adapter._key(None)]["request_id"]
+    store = adapter._get_manager().store
+    observation = store.observation(request_id)
+    assert observation["input_limit"] == adapter._get_manager().config.input_limit - 400
+    assert observation["elapsed_ms"] >= 0
+    assert observation["count_source"] == "local_estimate"
+    assert "≈" in events[0]["data"]["description"]
+    assert str(observation["input_limit"]) in events[0]["data"]["description"].replace(",", "")
+    event = {
+        "model": "m",
+        "usage": {"prompt_tokens": 1234, "prompt_tokens_details": {"cached_tokens": 800}},
+    }
+    assert await adapter.stream(event, __metadata__=metadata, __event_emitter__=emit) is event
+    assert len(events) == 2
+    actual = events[-1]["data"]["description"]
+    assert "1,234" in actual and "本次实测" in actual and "缓存读 800" in actual
+    assert "≈" not in actual and "\n" not in actual
+    # Output-only chunks and duplicate reports do not append another UI status.
+    await adapter.stream(event, __metadata__=metadata, __event_emitter__=emit)
+    await adapter.stream(
+        {"usage": {"completion_tokens": 25}}, __metadata__=metadata, __event_emitter__=emit
+    )
+    assert len(events) == 2
+    assert store.observation(request_id) == observation  # Preserve the original dispatch decision.
+    assert store.usage(request_id)["input_tokens"] == 1234
+    assert body["messages"] == compiled
+    assert not any(m["content"].startswith("lethes ·") for m in body["messages"])
+    assert story()[1]["content"] not in caplog.text
+    assert any(r.lethes.get("input_tokens") == 1234 for r in caplog.records if hasattr(r, "lethes"))
+
+
+async def test_fresh_completed_metadata_can_render_persisted_observation_after_restart(adapter):
+    metadata = meta()
+    body = {"model": "m", "messages": story()}
+    await adapter.request(body, __metadata__=metadata)
+    request_id = metadata[adapter._key(None)]["request_id"]
+    restarted = OpenWebUIFilter()
+    restarted.valves = adapter.valves.model_copy()
+    events = []
+
+    async def emit(event):
+        events.append(event)
+
+    completed = {"model": "m", "chat_id": "c", "id": "m", "usage": {"prompt_tokens": 1200}}
+    await restarted.outlet(completed, __metadata__=meta(), __event_emitter__=emit)
+    assert "1,200" in events[-1]["data"]["description"]
+    assert restarted._get_manager().store.observation(request_id)["reason"] == "initial"
+    restarted._get_manager().store.delete_scope(digest(["u", "c"]))
+    assert restarted._get_manager().store.observation(request_id) is None
+
+
+@pytest.mark.parametrize(
+    "usage,model",
+    [
+        ({"prompt_tokens": 1000, "estimated": True}, "m"),
+        ({"prompt_tokens": 1000}, "different-route"),
+        ({"completion_tokens": 1000}, "m"),
+        ({"prompt_tokens": True}, "m"),
+    ],
+)
+async def test_unreliable_usage_never_appears_as_a_real_input_count(adapter, usage, model):
+    metadata = meta()
+    events = []
+
+    async def emit(event):
+        events.append(event)
+
+    await adapter.request(
+        {"model": "m", "messages": story()}, __metadata__=metadata, __event_emitter__=emit
+    )
+    await adapter.stream(
+        {"model": model, "usage": usage}, __metadata__=metadata, __event_emitter__=emit
+    )
+    assert len(events) == 1
+    assert "估算" in events[0]["data"]["description"]
+
+
+async def test_aggregate_usage_is_logged_without_replacing_single_request_status(adapter, caplog):
+    caplog.set_level("INFO", logger="lethes.integrations.open_webui")
+    metadata = meta()
+    events = []
+
+    async def emit(event):
+        events.append(event)
+
+    body = {"model": "m", "messages": story()}
+    await adapter.request(body, __metadata__=metadata, __event_emitter__=emit)
+    await adapter.request(body, __metadata__=metadata, __event_emitter__=emit)
+    await adapter.outlet(
+        {"model": "m", "usage": {"prompt_tokens": 9999}},
+        __metadata__=metadata,
+        __event_emitter__=emit,
+    )
+    assert len(events) == 2
+    assert any(r.lethes.get("aggregate") is True for r in caplog.records if hasattr(r, "lethes"))
+
+
+async def test_disconnected_status_emitter_does_not_fail_model_request(adapter):
+    async def disconnected(event):
+        raise ConnectionError("browser disconnected")
+
+    body = {"model": "m", "messages": story()}
+    metadata = meta()
+    assert (
+        await adapter.request(body, __metadata__=metadata, __event_emitter__=disconnected) is body
+    )
+    request_id = metadata[adapter._key(None)]["request_id"]
+    assert adapter._get_manager().store.observation(request_id)
+
+
+async def test_disabling_status_preserves_manager_prefix_and_audit(adapter):
+    metadata = meta()
+    body = {"model": "m", "messages": story()}
+    await adapter.request(body, __metadata__=metadata)
+    first_wire = copy.deepcopy(body["messages"])
+    manager = adapter._get_manager()
+    adapter.valves.show_status = False
+    events = []
+
+    async def emit(event):
+        events.append(event)
+
+    await adapter.request(body, __metadata__=metadata, __event_emitter__=emit)
+    assert adapter._get_manager() is manager
+    assert body["messages"] == first_wire and not events
+    assert manager.store.observation(metadata[adapter._key(None)]["request_id"])
+
+
+def test_local_embedding_settings_bind_retriever(adapter):
+    adapter.valves.embedding_model = "local-small"
+    adapter.valves.embedding_api_base = "http://embedding:80/v1"
+    adapter.valves.embedding_query_prefix = "query: "
+    adapter.valves.embedding_chunk_chars = 384
+    adapter.valves.embedding_chunk_overlap = 64
+    adapter.valves.semantic_floor = 0.1
+    retriever = adapter._get_manager().retriever
+    assert retriever.embedding_query_prefix == "query: "
+    assert retriever.embedding_chunk_chars == 384
+    assert retriever.embedding_chunk_overlap == 64
+    assert retriever.semantic_floor == 0.1

@@ -80,6 +80,13 @@ No approach guarantees implicit recall without a relevant cue. Real datasets mus
 measure that separately. Failed optional helper calls retain lexical retrieval
 and an explicit warning. Repeated embeddings and query expansions are cached.
 
+Optional embedding windows cover the complete source/query with overlap; query
+and document instructions are applied only to encoder inputs. Dense fusion uses
+one best-window score per original message/query, preserving original citations
+and avoiding extra votes for longer messages. Default windowing is disabled for
+compatibility. Similarity floors are configurable for the chosen model. See
+[small local models](local-models.md) for configuration and evaluation limits.
+
 Economic rebuild candidates may not lose newly included current-request recall
 coverage. Older in-cycle reminders can be reselected at rebuild. Candidate ranking
 quality and budget coverage are not converted into invented monetary values.
@@ -164,6 +171,18 @@ and handles a reconstructed full-source tool hop. Lifecycle metadata stays JSON
 serializable. Telemetry uses per-request correlation, including fresh metadata
 from `/api/chat/completed`, and never modifies generated prose.
 
+Each dispatch also stores an immutable observation under its request ID: selected
+budget count/provenance, effective input limit, epoch/reason, source coverage and
+omissions, potential prefix, warnings, economics and preparation latency. Provider
+usage remains separate so later calibration cannot rewrite the dispatch decision.
+INFO logs expose both records without original text, queries, vectors or secrets.
+The native status description is one line and updates from estimated/historical
+counts to authoritative current usage; aggregates or explicitly estimated usage
+do not receive an actual-input label. Repeated usage and output-only updates avoid
+duplicate status events. Missing/disconnected UI emitters do not fail generation.
+Disabling status emission leaves the assembly domain unchanged. Status-history
+folding remains a host UI preference.
+
 The persistent SQLite path must be on a backend volume with working file locks.
 Stored snapshots/attempts contain original chat text. Deployments must connect
 chat deletion/retention to `delete_scope`; no automatic deletion event is registered
@@ -173,6 +192,8 @@ Official integration sources checked 2026-11-06:
 
 - https://docs.openwebui.com/features/extensibility/plugin/functions/filter/
 - https://docs.openwebui.com/features/extensibility/plugin/development/reserved-args/
+- https://docs.openwebui.com/features/extensibility/plugin/development/events/
+- https://github.com/open-webui/open-webui/blob/main/src/lib/components/chat/Messages/ResponseMessage/StatusHistory.svelte
 - https://docs.litellm.ai/docs/completion/token_usage
 - https://docs.litellm.ai/docs/tokenize
 

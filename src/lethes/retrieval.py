@@ -51,6 +51,17 @@ def cosine(a: list[float], b: list[float]) -> float:
     return numerator / denominator if denominator else 0.0
 
 
+def windows(value: str, size: int, overlap: int) -> list[str]:
+    if not size or len(value) <= size:
+        return [value]
+    result = []
+    for start in range(0, len(value), size - overlap):
+        result.append(value[start : start + size])
+        if start + size >= len(value):
+            break
+    return result
+
+
 class HybridRetriever:
     def __init__(
         self,
@@ -60,12 +71,27 @@ class HybridRetriever:
         query_messages: int = 8,
         neighbors: int = 1,
         semantic_floor: float = 0.25,
+        embedding_chunk_chars: int = 0,
+        embedding_chunk_overlap: int = 64,
+        embedding_query_prefix: str = "",
+        embedding_document_prefix: str = "",
     ) -> None:
+        if (
+            embedding_chunk_chars < 0
+            or embedding_chunk_overlap < 0
+            or (embedding_chunk_chars and embedding_chunk_overlap >= embedding_chunk_chars)
+            or not -1 <= semantic_floor <= 1
+        ):
+            raise ValueError("Invalid semantic window or similarity floor")
         self.embedder = embedder
         self.expander = expander
         self.query_messages = query_messages
         self.neighbors = neighbors
         self.semantic_floor = semantic_floor
+        self.embedding_chunk_chars = embedding_chunk_chars
+        self.embedding_chunk_overlap = embedding_chunk_overlap
+        self.embedding_query_prefix = embedding_query_prefix
+        self.embedding_document_prefix = embedding_document_prefix
         self._term_cache: OrderedDict[str, Counter[str]] = OrderedDict()
 
     def _terms(self, value: str) -> Counter[str]:
@@ -147,17 +173,40 @@ class HybridRetriever:
                 primary_hits.append(min(i for score, i in scores if score >= floor))
         if self.embedder:
             try:
-                dense_docs = [(i, d) for i, d in enumerate(docs) if d.strip()]
-                vectors = await self.embedder.embed([d for _, d in dense_docs] + queries)
-                if len(vectors) != len(dense_docs) + len(queries):
+                dense_docs = [
+                    (i, window)
+                    for i, doc in enumerate(docs)
+                    if doc.strip()
+                    for window in windows(
+                        doc, self.embedding_chunk_chars, self.embedding_chunk_overlap
+                    )
+                ]
+                dense_queries = [
+                    (query, window)
+                    for query in queries
+                    for window in windows(
+                        query, self.embedding_chunk_chars, self.embedding_chunk_overlap
+                    )
+                ]
+                vectors = await self.embedder.embed(
+                    [self.embedding_document_prefix + d for _, d in dense_docs]
+                    + [self.embedding_query_prefix + q for _, q in dense_queries]
+                )
+                if len(vectors) != len(dense_docs) + len(dense_queries):
                     raise ValueError("Wrong embedding count")
-                for query, query_vector in zip(queries, vectors[len(dense_docs) :], strict=True):
-                    scored = [
-                        (cosine(v, query_vector), original_index)
-                        for (original_index, _), v in zip(
-                            dense_docs, vectors[: len(dense_docs)], strict=True
-                        )
-                    ]
+                semantic_scores: dict[str, dict[int, float]] = {q: {} for q in queries}
+                for (query, _), query_vector in zip(
+                    dense_queries, vectors[len(dense_docs) :], strict=True
+                ):
+                    for (original_index, _), vector in zip(
+                        dense_docs, vectors[: len(dense_docs)], strict=True
+                    ):
+                        score = cosine(vector, query_vector)
+                        current = semantic_scores[query]
+                        current[original_index] = max(current.get(original_index, -1.0), score)
+                for query, by_message in semantic_scores.items():
+                    # One vote per original message/query, regardless of window count.
+                    scored = [(score, index) for index, score in by_message.items()]
                     for rank, (score, index) in enumerate(sorted(scored, reverse=True)):
                         if score >= self.semantic_floor:
                             if rank == 0 and query == latest_user:
