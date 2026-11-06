@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import uuid
+from copy import copy
 from dataclasses import asdict, dataclass, replace
 
 from .costs import CachePricing, RenewalPolicy, parse_usage
@@ -12,7 +13,14 @@ from .history import History, Message, canonical, digest
 from .retrieval import HybridRetriever, Retrieval, Retriever
 from .state import ContextResult, Reminder, Snapshot, Span
 from .store import SQLiteStore
-from .tokens import ByteTokenCounter, TokenCounter, common_prefix_tokens
+from .tokens import (
+    ByteTokenCounter,
+    EnvelopeCounter,
+    TokenCounter,
+    UsageAwareCounter,
+    common_prefix_tokens,
+    request_fingerprint,
+)
 
 
 class ContextOverflow(ValueError):
@@ -145,7 +153,7 @@ class ContextManager:
         if not turns:
             return previous.growth
         delta = (
-            raw_tokens - previous.raw_tokens
+            raw_tokens - self.counter.count(history.messages[: previous.history_length])
             if wire_tokens is None
             else wire_tokens - self.counter.count(previous.messages)
         )
@@ -217,9 +225,12 @@ class ContextManager:
 
     def _tail_start(self, history: History, limit: int) -> int:
         messages = history.messages
+        baseline = self.counter.count([])
         recent_limit = min(
-            self.config.recent_tokens,
-            limit - self.counter.count(messages[: history.instruction_count]) + 3,
+            self.config.recent_tokens + baseline - 3,
+            int(limit * self.config.rebuild_fill)
+            - self.counter.count(messages[: history.instruction_count])
+            + baseline,
         )
         starts = history.turn_starts()
         if not starts:
@@ -326,28 +337,95 @@ class ContextManager:
         model: str = "default",
         environment: dict | None = None,
         extra_tokens: int = 0,
+        extra_reply_tokens: int = 0,
+        request_context: dict | None = None,
         correlation: str = "",
     ) -> ContextResult:
         if not chat_id or not user_id:
             raise ValueError("Stable chat_id and user_id are required")
-        if extra_tokens < 0:
-            raise ValueError("extra_tokens must be nonnegative")
+        if min(extra_tokens, extra_reply_tokens) < 0:
+            raise ValueError("Token reservations must be nonnegative")
         history = History.from_messages(messages)
         scope = digest([user_id, chat_id])
-        domain = digest(
-            [
-                self.namespace,
-                model,
-                environment or {},
-                asdict(self.config),
-                asdict(self.pricing) if self.pricing else None,
-                getattr(self.counter, "cache_identity", type(self.counter).__qualname__),
-                extra_tokens,
-            ]
-        )
-        limit = self.config.input_limit - extra_tokens
+        binding_context = request_context
+        if binding_context is None:
+            binding_context = getattr(self.counter, "request_context", None)
+        if binding_context is None:
+            binding_context = {
+                k: v
+                for k, v in (environment or {}).items()
+                if k in {"tools", "tool_choice", "response_format"} and v
+            }
+        context_key = request_fingerprint(binding_context)
+        domain_parts = [
+            self.namespace,
+            model,
+            environment or {},
+            asdict(self.config),
+            asdict(self.pricing) if self.pricing else None,
+            getattr(self.counter, "cache_identity", type(self.counter).__qualname__),
+            extra_tokens,
+        ]
+        if binding_context:
+            domain_parts.append(["request_context", context_key])
+        domain = digest(domain_parts)
+        limit = self.config.input_limit - extra_reply_tokens
         if limit <= 0:
             raise ContextOverflow("Request overhead consumes the input budget")
+        models = tuple(
+            dict.fromkeys(
+                str(m)
+                for m in (
+                    model,
+                    ((environment or {}).get("model_info") or {}).get("base_model_id"),
+                    getattr(self.counter, "model", None),
+                    getattr(self.counter, "sdk_model", None),
+                )
+                if m
+            )
+        )
+        measurement_domain = digest(
+            [
+                ((environment or {}).get("model_info") or {}).get("base_model_id")
+                or (
+                    model if model and model != "default" else getattr(self.counter, "model", model)
+                ),
+                request_fingerprint(environment or {}),
+                context_key,
+            ]
+        )
+        # Counting observations are local to this invocation, never assigned to a
+        # shared manager/counter used by concurrent models or conversations.
+        worker = copy(self)
+        worker.counter = UsageAwareCounter(
+            EnvelopeCounter(self.counter, extra_tokens),
+            self.store.measurements(scope, measurement_domain, domain),
+            lambda wire: (
+                self.store.measurement(scope, measurement_domain, wire)
+                or self.store.measurement(scope, domain, wire)
+            ),
+        )
+        return await worker._prepare(
+            history,
+            scope=scope,
+            domain=domain,
+            limit=limit,
+            correlation=correlation,
+            models=models,
+            measurement_domain=measurement_domain,
+        )
+
+    async def _prepare(
+        self,
+        history: History,
+        *,
+        scope: str,
+        domain: str,
+        limit: int,
+        correlation: str,
+        models: tuple[str, ...],
+        measurement_domain: str,
+    ) -> ContextResult:
         previous = self.store.ancestor(scope, domain, history.heads)
         ttl = self.pricing.ttl_seconds if self.pricing else 300
         recent = self.store.recent_wires(scope, domain, ttl)
@@ -360,8 +438,23 @@ class ContextManager:
 
         raw_tokens = self.counter.count(history.messages)
         economics: dict[str, float] = {}
-        if previous and previous.head == history.head:
+        replace_previous = None
+        if (
+            previous
+            and previous.head == history.head
+            and self.counter.count(previous.messages) <= limit
+        ):
             snapshot, reason = previous, "replay"
+        elif previous and previous.head == history.head:
+            snapshot = await self._plan(
+                history,
+                raw_tokens,
+                limit,
+                compact=True,
+                resident=covered_indices(previous, len(history)),
+            )
+            replace_previous = previous
+            reason = "count_capacity"
         else:
             reason = "initial" if previous is None else "append"
             candidate = None
@@ -418,12 +511,12 @@ class ContextManager:
                 available = covered_indices(candidate, len(history))
                 if required <= available:
                     decision = RenewalPolicy(self.pricing, self.config.economic_margin).decide(
-                        old_tokens=self.counter.count(snapshot.messages) + extra_tokens,
-                        new_tokens=self.counter.count(candidate.messages) + extra_tokens,
+                        old_tokens=self.counter.count(snapshot.messages),
+                        new_tokens=self.counter.count(candidate.messages),
                         old_shared=shared(snapshot),
                         new_shared=shared(candidate),
                         growth=snapshot.growth,
-                        capacity=self.config.input_limit,
+                        capacity=limit,
                     )
                     economics = {
                         "cycle_rounds": decision.cycle_rounds,
@@ -436,26 +529,61 @@ class ContextManager:
                             candidate, growth=self._growth(history, previous, raw_tokens)
                         )
                         reason = "economic"
-        snapshot = self.store.save(scope, domain, snapshot)
+        proposed = snapshot
+        if replace_previous:
+            snapshot = self.store.replace_overbudget(scope, domain, snapshot, replace_previous)
+        else:
+            snapshot = self.store.save(scope, domain, snapshot)
+        if self.counter.count(snapshot.messages) > limit:
+            # A concurrent first writer must not restore a layout that a newly
+            # observed count (or a larger reply reservation) has made infeasible.
+            if self.counter.count(proposed.messages) <= limit:
+                snapshot = self.store.replace_overbudget(scope, domain, proposed, snapshot)
+            if self.counter.count(snapshot.messages) > limit:
+                raise ContextOverflow("Reported input usage exceeds the available input budget")
         omitted, warnings = snapshot.omitted, snapshot.warnings
         potential = shared(snapshot)
-        request_id = self.store.attempt(scope, domain, snapshot, correlation)
+        request_id = self.store.attempt(
+            scope, domain, snapshot, correlation, models, measurement_domain
+        )
         recalled = tuple(s for r in snapshot.reminders for s in r.spans)
+        assert isinstance(self.counter, UsageAwareCounter)
+        count = self.counter.describe(snapshot.messages)
         return ContextResult(
             snapshot.messages,
             request_id,
             snapshot,
             reason,
-            self.counter.count(snapshot.messages) + extra_tokens,
+            count.tokens,
             potential,
             recalled,
             omitted,
             warnings,
             economics,
+            count.source,
+            count.reference,
         )
 
-    def record_usage(self, request_id: str, usage: dict) -> None:
+    def record_usage(
+        self,
+        request_id: str,
+        usage: dict,
+        *,
+        model: str | None = None,
+        origin: str = "provider",
+        aggregate: bool = False,
+    ) -> None:
         previous = self.store.usage(request_id)
+        if (
+            origin == "outlet"
+            and previous
+            and previous.get("usage_origin") in {"provider", "provider_stream"}
+        ):
+            return
         raw = dict(previous.get("raw", {})) if previous else {}
+        if previous and previous.get("usage_origin") == "outlet" and origin != "outlet":
+            raw = {}
         raw.update(usage)
-        self.store.record_usage(request_id, parse_usage(raw))
+        reported_model = model or (previous or {}).get("reported_model")
+        parsed = {**parse_usage(raw), "usage_origin": origin, "aggregate": aggregate}
+        self.store.record_usage(request_id, parsed, reported_model)

@@ -112,6 +112,24 @@ async def test_completed_callback_with_fresh_metadata_can_correlate(adapter):
     assert adapter._get_manager().store.usage(request_id)["input_tokens"] == 3000
 
 
+async def test_stream_model_from_earlier_chunk_checks_usage_and_resets_per_hop(adapter):
+    metadata = meta()
+    body = {"model": "requested", "messages": story()}
+    await adapter.request(body, __metadata__=metadata)
+    context = metadata[adapter._key(None)]
+    first_id = context["request_id"]
+    await adapter.stream({"model": "different-route", "choices": []}, __metadata__=metadata)
+    await adapter.stream({"usage": {"prompt_tokens": 100}}, __metadata__=metadata)
+    usage = adapter._get_manager().store.usage(first_id)
+    assert usage["reported_model"] == "different-route"
+    assert usage["measurement_eligible"] is False
+    await adapter.request(body, __metadata__=metadata)
+    await adapter.stream({"usage": {"prompt_tokens": 101}}, __metadata__=metadata)
+    next_usage = adapter._get_manager().store.usage(context["request_id"])
+    assert "reported_model" not in next_usage
+    assert context["response_model"] is None
+
+
 async def test_valves_changes_invalidate_configuration(adapter):
     first = adapter._get_manager()
     adapter.valves.recent_tokens += 1
@@ -187,3 +205,54 @@ async def test_merged_system_tool_hop_rehydrates_all_original_history(adapter):
     source = metadata[adapter._key(None)]["source"]
     assert source[1:] == original[1:] + tool
     assert body["messages"][-2:] == tool
+
+
+async def test_request_specific_litellm_models_and_tools_are_not_shared(adapter, monkeypatch):
+    seen = []
+    from lethes.tokens import ByteTokenCounter
+
+    class FakeCounter(ByteTokenCounter):
+        def __init__(self, model, **kwargs):
+            self.model = model
+            self.sdk_model = model
+            self.cache_identity = "sdk:" + model
+            seen.append((model, kwargs))
+
+    monkeypatch.setattr("lethes.integrations.open_webui.LiteLLMTokenCounter", FakeCounter)
+    adapter.valves.tokenizer = "litellm"
+    base = adapter._get_manager()
+
+    async def request(model, chat):
+        body = {
+            "model": "workspace-" + chat,
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{"type": "function", "function": {"name": chat}}],
+        }
+        metadata = meta(chat)
+        await adapter.request(
+            body,
+            __metadata__=metadata,
+            __model__={"info": {"base_model_id": model, "params": {"system": "System " + chat}}},
+        )
+        return metadata
+
+    await asyncio.gather(request("gpt-4o", "a"), request("other-model", "b"))
+    assert {m for m, _ in seen} == {"gpt-4o", "other-model"}
+    assert {k["tools"][0]["function"]["name"] for _, k in seen} == {"a", "b"}
+    assert isinstance(base.counter, ByteTokenCounter) and not isinstance(base.counter, FakeCounter)
+
+
+async def test_aggregated_outlet_after_tool_hops_is_not_a_prompt_measurement(adapter):
+    metadata = meta()
+    body = {"model": "m", "messages": [{"role": "user", "content": "hello"}]}
+    await adapter.request(body, __metadata__=metadata)
+    # A repeated provider hop may have the same compiled body, but a turn total
+    # still cannot be attached to just the last per-call request ID.
+    await adapter.request(body, __metadata__=metadata)
+    request_id = metadata[adapter._key(None)]["request_id"]
+    await adapter.outlet({"model": "m", "usage": {"prompt_tokens": 999}}, __metadata__=metadata)
+    assert adapter._get_manager().store.usage(request_id)["aggregate"] is True
+    replay_meta = meta("c", "another-message")
+    replay_body = {"model": "m", "messages": [{"role": "user", "content": "hello"}]}
+    await adapter.request(replay_body, __metadata__=replay_meta)
+    assert replay_body["messages"] == [{"role": "user", "content": "hello"}]

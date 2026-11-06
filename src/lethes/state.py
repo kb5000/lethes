@@ -75,3 +75,10 @@ class ContextResult:
     omitted: tuple[Span, ...] = ()
     warnings: tuple[str, ...] = ()
     economics: dict[str, float] = field(default_factory=dict)
+    count_source: str = "local_estimate"
+    count_reference: str | None = None
+
+    @property
+    def input_tokens(self) -> int:
+        """Budget count, with provenance in count_source; legacy alias is estimated_tokens."""
+        return self.estimated_tokens

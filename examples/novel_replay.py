@@ -14,7 +14,14 @@ import json
 import time
 from pathlib import Path
 
-from lethes import CachePricing, ContextConfig, ContextManager, SQLiteStore, TiktokenCounter
+from lethes import (
+    CachePricing,
+    ContextConfig,
+    ContextManager,
+    LiteLLMTokenCounter,
+    SQLiteStore,
+    TiktokenCounter,
+)
 from lethes.history import History, normalize
 
 
@@ -68,6 +75,8 @@ def validate(result, raw: list[dict], limit: int) -> None:
 
 async def run(args: argparse.Namespace) -> None:
     source = args.text.read_text(encoding=args.encoding)
+    tokenizer = getattr(args, "tokenizer", "bytes")
+    tokenizer_model = getattr(args, "tokenizer_model", "")
     passages = chunks(source, args.chunk_chars)
     original = dialogue(passages)
     store = SQLiteStore(args.state)
@@ -86,9 +95,13 @@ async def run(args: argparse.Namespace) -> None:
         ),
         store=store,
         pricing=pricing,
-        counter=TiktokenCounter(args.tokenizer)
-        if getattr(args, "tokenizer", "bytes") != "bytes"
-        else None,
+        counter=(
+            LiteLLMTokenCounter(tokenizer_model)
+            if tokenizer == "litellm"
+            else TiktokenCounter(tokenizer)
+            if tokenizer != "bytes"
+            else None
+        ),
     )
     started = time.perf_counter()
     rows = []
@@ -167,6 +180,7 @@ async def run(args: argparse.Namespace) -> None:
             ),
             "actual_cache_usage": None,
             "tokenizer": getattr(args, "tokenizer", "bytes"),
+            "tokenizer_model": getattr(args, "tokenizer_model", None),
             "probe_results": probe_rows,
             "elapsed_seconds": round(time.perf_counter() - started, 2),
         }
@@ -184,6 +198,7 @@ if __name__ == "__main__":
     parser.add_argument("--stride", type=int, default=1)
     parser.add_argument("--context-window", type=int, default=32768)
     parser.add_argument("--tokenizer", default="bytes")
+    parser.add_argument("--tokenizer-model", default="")
     parser.add_argument("--state", default=":memory:")
     parser.add_argument("--input-price", type=float)
     parser.add_argument("--cached-price", type=float)

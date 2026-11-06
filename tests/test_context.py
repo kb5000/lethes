@@ -5,7 +5,7 @@ import json
 import pytest
 from conftest import ScriptedRetriever, prepare, story
 
-from lethes import ContextConfig, ContextManager, ContextOverflow, Span, SQLiteStore
+from lethes import ContextConfig, ContextManager, ContextOverflow, Retrieval, Span, SQLiteStore
 from lethes.engine import assemble
 from lethes.history import History, digest
 
@@ -45,6 +45,62 @@ async def test_reminders_remain_in_place_and_prefix_grows(manager, retriever):
     assert len(second.snapshot.reminders) == 2
     assert second.potential_cached_tokens > 0
     assert second.snapshot.epoch == first.snapshot.epoch
+
+
+async def test_oversized_recent_budget_leaves_space_for_direct_recall_and_append():
+    class DirectRetriever:
+        async def search(self, history, before):
+            return Retrieval((Span(1, 3),), required=(Span(1, 3),))
+
+    manager = ContextManager(
+        ContextConfig(
+            context_window=6000,
+            reply_reserve=500,
+            safety_reserve=200,
+            recent_tokens=20000,
+            minimum_recent_turns=1,
+            rebuild_fill=0.6,
+        ),
+        retriever=DirectRetriever(),
+    )
+    raw = story(30)
+    first = await prepare(manager, raw)
+    assert Span(1, 3) in first.recalled
+    assert first.input_tokens < manager.config.input_limit - 100
+    extended = raw + [
+        {"role": "assistant", "content": "She remembers."},
+        {"role": "user", "content": "Continue."},
+    ]
+    second = await prepare(manager, extended)
+    assert second.reason == "append"
+    assert second.snapshot.epoch == first.snapshot.epoch
+    assert second.messages[: len(first.messages)] == first.messages
+
+
+async def test_minimum_recent_turns_can_exceed_rebuild_fill_target():
+    raw = [
+        {"role": "system", "content": "Narrate"},
+        {"role": "user", "content": "old " * 300},
+        {"role": "assistant", "content": "old " * 300},
+        {"role": "user", "content": "recent " * 200},
+        {"role": "assistant", "content": "recent " * 200},
+        {"role": "user", "content": "Continue."},
+    ]
+    manager = ContextManager(
+        ContextConfig(
+            context_window=5000,
+            reply_reserve=200,
+            safety_reserve=100,
+            recent_tokens=10000,
+            minimum_recent_turns=2,
+            rebuild_fill=0.5,
+        ),
+        retriever=ScriptedRetriever(),
+    )
+    result = await prepare(manager, raw)
+    assert result.messages[-3:] == raw[-3:]
+    assert manager.config.input_limit * manager.config.rebuild_fill < result.input_tokens
+    assert result.input_tokens <= manager.config.input_limit
 
 
 async def test_repeated_input_is_idempotent_even_if_retrieval_changes(manager, retriever):

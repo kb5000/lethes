@@ -20,7 +20,7 @@ from lethes.history import canonical, digest, normalize
 from lethes.providers import OpenAIEmbeddings, OpenAIQueryExpander
 from lethes.retrieval import HybridRetriever
 from lethes.store import SQLiteStore
-from lethes.tokens import ByteTokenCounter, TiktokenCounter
+from lethes.tokens import ByteTokenCounter, LiteLLMTokenCounter, TiktokenCounter
 
 log = logging.getLogger(__name__)
 Emitter = Callable[[dict], Awaitable[None]]
@@ -52,7 +52,12 @@ class OpenWebUIFilter:
         recent_tokens: int = Field(default=8192, gt=0)
         minimum_recent_turns: int = Field(default=2, gt=0)
         rebuild_fill: float = Field(default=0.75, gt=0, lt=1)
-        tokenizer: str = Field(default="bytes", description="bytes or a tiktoken encoding name")
+        tokenizer: str = Field(
+            default="bytes", description="bytes, litellm, or a tiktoken encoding"
+        )
+        tokenizer_model: str = Field(
+            default="", description="Actual LiteLLM model; defaults to workspace base_model_id"
+        )
         input_price: float | None = Field(default=None, ge=0, description="USD per million tokens")
         cached_input_price: float | None = Field(default=None, ge=0)
         cache_minimum: int = Field(default=1024, ge=0)
@@ -118,7 +123,7 @@ class OpenWebUIFilter:
             retriever=HybridRetriever(embedder=embedder, expander=expander),
             pricing=pricing,
             counter=ByteTokenCounter()
-            if valves.tokenizer == "bytes"
+            if valves.tokenizer in {"bytes", "litellm"}
             else TiktokenCounter(valves.tokenizer),
             namespace=key,
         )
@@ -211,16 +216,48 @@ class OpenWebUIFilter:
             "tool_choice": body.get("tool_choice"),
             "response_format": body.get("response_format"),
         }
-        overhead = len(canonical(body.get("tools") or []).encode())
-        if body.get("response_format"):
-            overhead += len(canonical(body["response_format"]).encode())
         workspace_system = (model_info.get("params") or {}).get("system")
-        if workspace_system:
-            overhead += manager.counter.count([{"role": "system", "content": workspace_system}])
+        token_context = {
+            k: v
+            for k, v in {
+                "tools": body.get("tools"),
+                "tool_choice": body.get("tool_choice"),
+                "response_format": body.get("response_format"),
+                "prefix_messages": [{"role": "system", "content": workspace_system}]
+                if workspace_system
+                else [],
+            }.items()
+            if v
+        }
+        if self.valves.tokenizer == "litellm":
+            # Bind a request-local model/envelope; never mutate a shared counter
+            # while another chat/model is awaiting retrieval or a response.
+            model = (
+                self.valves.tokenizer_model
+                or model_info.get("base_model_id")
+                or body.get("model")
+                or (__model__ or {}).get("id")
+            )
+            manager = copy.copy(manager)
+            manager.counter = LiteLLMTokenCounter(
+                str(model or ""),
+                tools=body.get("tools"),
+                tool_choice=body.get("tool_choice"),
+                response_format=body.get("response_format"),
+                prefix_messages=[{"role": "system", "content": workspace_system}]
+                if workspace_system
+                else [],
+            )
+            overhead = 0
+        else:
+            overhead = len(canonical(body.get("tools") or []).encode())
+            if body.get("response_format"):
+                overhead += len(canonical(body["response_format"]).encode())
+            if workspace_system:
+                overhead += manager.counter.count([{"role": "system", "content": workspace_system}])
         reply = body.get("max_completion_tokens", body.get("max_tokens", 0)) or 0
         if not isinstance(reply, int) or reply < 0:
             raise ValueError("Invalid reply token limit")
-        overhead += max(0, reply - manager.config.reply_reserve)
         if __message_id__ and not metadata.get("message_id"):
             metadata["message_id"] = __message_id__
         correlation = self._correlation({**metadata, "chat_id": chat_id}, __user__, body)
@@ -231,6 +268,8 @@ class OpenWebUIFilter:
             model=str(body.get("model") or (__model__ or {}).get("id") or "default"),
             environment=environment,
             extra_tokens=overhead,
+            extra_reply_tokens=max(0, reply - manager.config.reply_reserve),
+            request_context=token_context,
             correlation=correlation,
         )
         context.update(
@@ -240,6 +279,8 @@ class OpenWebUIFilter:
                 "overlays": [r.payload for r in result.snapshot.reminders],
                 "request_id": result.request_id,
                 "state_path": self.valves.state_path,
+                "provider_hops": context.get("provider_hops", 0) + 1,
+                "response_model": None,
             }
         )
         body["messages"] = result.messages
@@ -250,6 +291,8 @@ class OpenWebUIFilter:
                     "request_id": result.request_id,
                     "reason": result.reason,
                     "estimated_tokens": result.estimated_tokens,
+                    "count_source": result.count_source,
+                    "count_reference": result.count_reference,
                     "potential_cached_tokens": result.potential_cached_tokens,
                     "omitted": [asdict(s) for s in result.omitted],
                     "warnings": result.warnings,
@@ -283,22 +326,58 @@ class OpenWebUIFilter:
         if not isinstance(data, dict):
             data = {}
         message = event.get("message") or data.get("message") or {}
+        reported = event.get("model") or data.get("model")
+        if isinstance(reported, str):
+            # Some streams name the model in an earlier chunk than their usage.
+            context["response_model"] = reported
         usage = event.get("usage") or data.get("usage")
         if not usage and isinstance(message, dict):
             usage = message.get("usage")
         if isinstance(usage, dict) and context.get("request_id"):
-            self._record_usage(context, context["request_id"], usage)
+            self._record_usage(
+                context,
+                context["request_id"],
+                usage,
+                context.get("response_model"),
+            )
         return event
 
-    def _record_usage(self, context: dict, request_id: str, usage: dict) -> None:
+    def _record_usage(
+        self,
+        context: dict,
+        request_id: str,
+        usage: dict,
+        model: str | None = None,
+        origin: str = "provider_stream",
+    ) -> None:
         path = context.get("state_path", self.valves.state_path)
         if path == self.valves.state_path:
-            self._get_manager().record_usage(request_id, usage)
+            manager = self._get_manager()
+            manager.record_usage(
+                request_id,
+                usage,
+                model=model,
+                origin=origin,
+                aggregate=origin == "outlet"
+                and (
+                    context.get("provider_hops", 1) > 1
+                    or manager.store.turn_attempts(request_id) > 1
+                ),
+            )
         else:
             # A valve change must not redirect an in-flight response to a different database.
             store = SQLiteStore(path)
             try:
-                ContextManager(store=store).record_usage(request_id, usage)
+                ContextManager(store=store).record_usage(
+                    request_id,
+                    usage,
+                    model=model,
+                    origin=origin,
+                    aggregate=origin == "outlet"
+                    and (
+                        context.get("provider_hops", 1) > 1 or store.turn_attempts(request_id) > 1
+                    ),
+                )
             finally:
                 store.close()
 
@@ -320,5 +399,12 @@ class OpenWebUIFilter:
                 self._correlation(metadata, __user__, body)
             )
             if request_id:
-                self._record_usage(context, request_id, usage)
+                reported = body.get("model")
+                self._record_usage(
+                    context,
+                    request_id,
+                    usage,
+                    reported if isinstance(reported, str) else None,
+                    origin="outlet",
+                )
         return body

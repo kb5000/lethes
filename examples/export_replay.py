@@ -10,7 +10,7 @@ import json
 import time
 from pathlib import Path
 
-from lethes import CachePricing, ContextConfig, ContextManager, TiktokenCounter
+from lethes import CachePricing, ContextConfig, ContextManager, LiteLLMTokenCounter, TiktokenCounter
 from lethes.history import History
 from lethes.importers import open_webui_paths
 
@@ -47,7 +47,13 @@ async def run(args):
             recent_tokens=args.recent_tokens,
         ),
         pricing=pricing,
-        counter=TiktokenCounter(args.tokenizer) if args.tokenizer != "bytes" else None,
+        counter=(
+            LiteLLMTokenCounter(args.tokenizer_model)
+            if args.tokenizer == "litellm"
+            else TiktokenCounter(args.tokenizer)
+            if args.tokenizer != "bytes"
+            else None
+        ),
     )
     started = time.perf_counter()
     rows = []
@@ -126,6 +132,7 @@ async def run(args):
         "input_output_edit_restore_valid": True,
         "actual_cache_usage": None,
         "tokenizer": args.tokenizer,
+        "tokenizer_model": args.tokenizer_model,
         "probe_results": probes,
         "elapsed_seconds": round(time.perf_counter() - started, 2),
     }
@@ -141,6 +148,7 @@ if __name__ == "__main__":
     parser.add_argument("--context-window", type=int, default=32768)
     parser.add_argument("--recent-tokens", type=int, default=8192)
     parser.add_argument("--tokenizer", default="bytes")
+    parser.add_argument("--tokenizer-model", default="")
     parser.add_argument("--input-price", type=float)
     parser.add_argument("--cached-price", type=float)
     parser.add_argument("--output", type=Path, default=Path("/tmp/lethes-interactive-report"))

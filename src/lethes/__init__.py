@@ -5,7 +5,7 @@ from .engine import ContextConfig, ContextManager, ContextOverflow
 from .retrieval import HybridRetriever, Retrieval
 from .state import ContextResult, Span
 from .store import SQLiteStore
-from .tokens import ByteTokenCounter, TiktokenCounter
+from .tokens import ByteTokenCounter, LiteLLMTokenCounter, TiktokenCounter
 
 __version__ = "2.0.0a1"
 __all__ = [
@@ -16,6 +16,7 @@ __all__ = [
     "ContextOverflow",
     "ContextResult",
     "HybridRetriever",
+    "LiteLLMTokenCounter",
     "RenewalPolicy",
     "Retrieval",
     "SQLiteStore",

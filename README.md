@@ -29,8 +29,10 @@ character state, or a rolling summary.
 - **Cycle economics:** with configured prices, compare renewal-cycle average costs
   for an indefinitely continuing chat. No user-departure horizon is assumed.
   Capacity and path validity remain hard constraints.
-- **Honest telemetry:** estimated tokens, potentially reusable prefixes and actual
-  provider usage are distinct. Missing provider usage is never fabricated.
+- **Usage-first budgeting:** matching historical provider input counts take
+  precedence over local counting. Appended content uses a measured prefix plus
+  an estimated increment. Count provenance, potential reusable prefixes and
+  actual provider cache usage remain distinct.
 
 ## Install and run
 
@@ -54,15 +56,35 @@ result = await manager.prepare(
 # Send result.messages to the model. The next invocation again supplies the
 # complete current original history, including any edits or chosen branches.
 # When available:
-manager.record_usage(result.request_id, provider_usage)
+manager.record_usage(result.request_id, provider_usage, model=returned_model_id)
 ```
 
 The default counter is an offline UTF-8 byte estimate with framing overhead. It is
 conservative for typical text BPE models, **not** a provider billing tokenizer.
-Install `lethes[tokenizers]` and pass `TiktokenCounter("o200k_base")` where suitable,
-or supply a provider-specific `TokenCounter`. Images/audio deliberately require
-such a counter; they are not silently counted as their URL text. The alpha is
-focused on text chat.
+For model-aware local counting, install `lethes[litellm]` and pass
+`LiteLLMTokenCounter("gpt-4o")` as `counter=`. This calls the SDK's local
+[`token_counter`](https://docs.litellm.ai/docs/completion/token_usage), including
+tools and tool choice; it does not request a completion or a remote count endpoint.
+Unknown deployment aliases require an explicit registered tokenizer model.
+`response_format` is reserved as serialized schema text because this SDK API has
+no schema parameter. Local counts remain estimates, including model fallbacks
+and default image costs; the alpha focuses on text chat. For offline operation,
+set `LITELLM_LOCAL_MODEL_COST_MAP=True` before importing the SDK and make the
+chosen model's tokenizer resources available locally.
+
+Alternatively install `lethes[tokenizers]` and pass
+`TiktokenCounter("o200k_base")`, or supply a provider-specific `TokenCounter`.
+The byte/tiktoken counters reject image/audio content rather than counting URLs.
+
+Provider usage is persisted and preferred for the same model, request envelope
+and assembled messages, even after restarting or switching local counters.
+For a matching complete-message prefix, only its appended portion is estimated.
+Edited/rebuilt layouts use local estimates with a conservative correction for
+observed undercounting; a cheaper old request cannot discount unrelated text.
+`result.input_tokens` reports the selected budget count (`estimated_tokens` is
+its compatibility alias). `count_source` distinguishes `reported_usage`,
+`reported_prefix_plus_estimate`, `usage_calibrated_estimate` and `local_estimate`;
+`count_reference` identifies the supporting historical request when applicable.
 
 Configure `CachePricing(uncached_per_million=..., cached_per_million=...)` to enable
 economic rebuilds. Without prices, valid prefixes are reused until capacity
@@ -76,6 +98,8 @@ Build and install this checkout into the **Open WebUI backend environment**:
 uv build
 # Inside the Open WebUI backend environment/container:
 pip install /path/to/lethes-2.0.0a1-py3-none-any.whl
+# For the LiteLLM counting backend, install its extra instead:
+pip install '/path/to/lethes-2.0.0a1-py3-none-any.whl[litellm]'
 ```
 
 In Admin Panel → Functions, import/paste
@@ -94,7 +118,10 @@ Set Valves:
 - `input_price`, `cached_input_price`: USD per million input tokens, plus cache
   minimum, block size and TTL matching your provider. Leave prices unset to disable
   speculative economic rebuilding. Economics use estimates until calibrated.
-- `tokenizer`: `bytes`, or an installed tiktoken encoding.
+- `tokenizer`: `bytes`, `litellm` (install the wheel with its `[litellm]` extra),
+  or an installed tiktoken encoding. `tokenizer_model` can map a deployment alias
+  to its actual registered model; otherwise LiteLLM uses workspace `base_model_id`
+  or the requested model ID. Bind dated returned model IDs explicitly when needed.
 - Optional embedding/query model, endpoint and key: enables semantic recall/query
   expansion. With no helper model, lexical recall remains fully offline. Helper
   failure falls back to lexical retrieval with a diagnostic. Embeddings and query
@@ -104,7 +131,11 @@ Set Valves:
 tasks. `request()` assembles after pipeline enrichment, and is idempotent across
 native tool-loop hops, whether the host rebuilds the original history or reuses
 an already compiled request. `stream()`/`outlet()` record available usage without
-altering output. Missing emitters and fresh completed-callback metadata are handled.
+altering output. Per-request provider usage takes precedence over outlet totals;
+multi-hop turn aggregates are saved but never used to count one request. Model
+mismatches remain in the ledger and invalidate older calibration for that route.
+Output tokens are excluded from input counts; reply capacity is reserved separately.
+Missing emitters and fresh completed-callback metadata are handled.
 Unscoped API calls without a user and chat identity pass through unchanged.
 
 This targets Open WebUI versions with the documented `request()` hook. The official
@@ -175,4 +206,6 @@ in model messages. Replay checks actual user-turn prefixes, stable overlays,
 input/output edits and restoring the original path. Both workload scripts accept
 `--probes`; token estimates default to `bytes`. `--tokenizer o200k_base` requires
 `lethes[tokenizers]` **and the encoding vocabulary to be available locally** (or a
-network that permits its initial download).
+network that permits its initial download). To exercise the LiteLLM backend, use
+`--tokenizer litellm --tokenizer-model gpt-4o` with its optional extra installed.
+Offline replay has no real provider usage to calibrate against.

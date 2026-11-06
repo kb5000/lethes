@@ -17,9 +17,11 @@ ancestor snapshot can still be reused. Prior branches remain independently
 restorable; no mutable shared branch pointer exists.
 
 Scopes isolate user/chat. Domains isolate model, request environment, config,
-counter identity and retrieval namespace. Custom integrations should change the
-namespace when changing retrieval/serialization semantics. SQLite snapshots are
-insert-only, first-writer-wins. Request attempts are separate, including retries
+counter identity and retrieval namespace. Tool/schema property order is part of
+the request fingerprint because providers may render it into a prompt. Custom
+integrations should change the namespace when changing retrieval/serialization
+semantics. SQLite snapshots are
+first-writer-wins while feasible. Request attempts are separate, including retries
 and cancelled attempts. The next supplied history determines which output was
 actually adopted; outlet callbacks never advance a narrative path.
 
@@ -29,9 +31,12 @@ Within a cycle the continuous-tail start and existing reminder bytes/anchors are
 immutable. New history extends the tail. New reminders are inserted before the
 latest new user message; tool follow-ups defer new recall while preserving old
 reminders and intact call/result structure. Initial/rebuilt cycles leave capacity
-headroom. Capacity rebuilding reselects a recent continuous tail and original
-historical passages. Current turns and instruction messages are protected; an
-impossible budget raises `ContextOverflow` rather than silently corrupting them.
+headroom. The recent-text soft budget also obeys the rebuild fill target so an
+oversized setting cannot consume recall space and all append headroom. Protected
+minimum recent turns may exceed that target. Capacity rebuilding reselects a
+recent continuous tail and original historical passages. Current turns and
+instruction messages are protected; an impossible budget raises `ContextOverflow`
+rather than silently corrupting them.
 
 Retrieval only sees the current visible path. Multiple recent original messages
 supply queries; inserted reminders are not fed back as query text. Optional query
@@ -116,8 +121,41 @@ never a claim that a request reached the provider or that a cache is resident.
 It can miss partial-message matches and provider-added prefixes. Attempts without
 usage may have been cancelled. Only observed usage gives billed cache quantities.
 Token counter estimates include framing heuristics; provider normalization can
-change counts. Reply, safety and tool-schema reserves bound local text assembly.
-Unsupported multimodal content requires a custom counter.
+change counts. Reply and safety reserves bound input capacity independently of
+input accounting; an output reservation must not be added to input token usage.
+Byte/tiktoken backends reserve external tool schemas separately. The optional
+LiteLLM adapter binds the model, tools, tool choice and workspace prefix once per
+request; `response_format` receives an extra text estimate. It uses local SDK
+counting, with default image costs to avoid fetching image URLs, and rejects
+unknown model mappings. It does not establish exact multimodal capacity.
+
+Authoritative per-request provider usage has priority over local estimates:
+
+1. An exact assembled message payload and matching model/envelope use measured
+   total input tokens, including cache-read/write input but excluding output.
+2. A full-message extension of a measured prefix uses that measured count plus
+   the nonnegative local-count increment. This is explicitly a hybrid estimate.
+3. Other layouts use local counting plus the largest recent positive undercount
+   observed for the same model/envelope. Negative offsets never discount rebuilt
+   or edited content merely because an unrelated request was cheaper.
+
+Measurements are scoped to user/chat and model/request environment independently
+of the local counter. Switching byte counting to LiteLLM does not erase usable
+provider counts. Exact lookup is indexed; calibration uses the latest 16 samples.
+New usage does not change the layout domain or reset the reminder cycle. A saved
+layout that is now over budget is replaced with a feasible preferred layout using
+compare-and-swap; prior layouts remain in an immutable archive and attempt ledger.
+The exception is a capacity repair, not an economic rebuild on every observation.
+
+`count_source` and `count_reference` expose measurement provenance. Counts explicitly
+marked estimated, invalid counts and multi-hop turn aggregates remain telemetry
+and cannot calibrate a single request. Per-request stream usage outranks outlet
+totals. A mismatched returned model invalidates older measurements for that route;
+request aliases and dated returned IDs require explicit model mapping. If no model
+is returned, usage is associated with the recorded request model. Older alpha
+records without explicit model metadata can only be backfilled within their original
+strict layout domain. Upstream unreported routing or prompt changes still require
+host configuration changes to invalidate the environment fingerprint.
 
 Open WebUI's `request()` runs on every model hop, after inlet/RAG processing but
 before provider normalization and workspace-model system prompt insertion. The
@@ -135,6 +173,8 @@ Official integration sources checked 2026-11-06:
 
 - https://docs.openwebui.com/features/extensibility/plugin/functions/filter/
 - https://docs.openwebui.com/features/extensibility/plugin/development/reserved-args/
+- https://docs.litellm.ai/docs/completion/token_usage
+- https://docs.litellm.ai/docs/tokenize
 
 ## Coverage under a full prefix
 

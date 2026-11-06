@@ -2,16 +2,25 @@
 
 ## Automated checks
 
-- 83 tests pass on Python 3.12; core coverage 94.14%.
+- 115 tests pass on Python 3.12 with the LiteLLM extra; core coverage 94.15%.
+  Without that extra, 113 pass and the two real-SDK checks are skipped.
 - Ruff lint/format and mypy pass.
 - Source distribution and wheel build; installation is checked in a separate
-  environment. CI tests Python 3.11/3.12/3.13; only 3.12 is executed locally.
+  environment. CI tests Python 3.11/3.12/3.13 and has a separate real LiteLLM SDK
+  contract job; only 3.12 is executed locally.
 - Tests cover exact replay, fixed reminder placement, source/version coverage,
   overlap with recent raw text, preventing weaker-candidate refill, preserving
   edited source versions, bounded resident preference, temporal recall, restoring
   compatible saved layouts, input/output edits, sibling/future exclusion, restart,
   concurrency, tool hops without new retrieval, capacities, cycle economics,
   optional helper failure, Open WebUI lifecycle shapes, exports and text loaders.
+- Usage-first tests cover exact measured counts, measured-prefix increments,
+  restart, switching counters, model/provider/envelope isolation, schema property
+  order, alias-route invalidation, invalid or estimated usage, Anthropic cache
+  input, separate output reserves, capacity repair and tool-turn aggregates.
+- LiteLLM 1.108.1 is exercised locally with its bundled model registry, Chinese
+  text, tool schemas and OpenAI/Azure model prefixes. No API key or completion is
+  used; fake SDK tests separately verify request isolation and adapter arguments.
 
 ## Supplied workloads
 
@@ -56,7 +65,39 @@ estimates, not actual model tokens, and the novel still rebuilds frequently.
 
 An o200k vocabulary initialization attempt was blocked by the environment proxy
 (403); no local vocabulary cache was available. No results from that tokenizer
-or a live model are claimed.
+or a live model are claimed. The subsequently added LiteLLM backend successfully
+counts `gpt-4o` locally using its available tokenizer resources.
+
+## LiteLLM replay
+
+The supplied interactive export was also replayed using LiteLLM 1.108.1 and an
+explicit illustrative `gpt-4o` tokenizer mapping: 8,192 context, 2,048 reply reserve,
+1,024 safety reserve, and 1,280 recent-token budget. This does not assert that the
+original chat used that model.
+
+All 21 user prefixes and both retained paths pass source, budget, stable-prefix,
+input/output-edit and restore checks, with zero duplicate source citations.
+The five selected passage probes pass. There are 13 assembly cycles and the
+largest local input count is 5,063 against a 5,120 input limit. These budgets and
+units differ from the byte-estimate comparison above and are not a before/after
+optimization comparison. No provider usage or real cache savings are measured.
+
+The novel also exercises an oversized recent budget: the same 8,192 context,
+2,048 reply and 1,024 safety reserves, but the loader's 8,192 recent-token setting.
+Before the fill-target repair, recent originals occupied almost all available
+input. After the repair, minimum recent turns remain protected while soft recent
+selection leaves space for direct recall and following messages.
+
+| Same LiteLLM novel workload, 279 steps | Before fill repair | After fill repair |
+|---|---:|---:|
+| Assembly cycles | 262 | 90 |
+| Largest local input / 5,120 limit | 5,120 | 5,115 |
+| Selected original-passage probes | 0/6 | 6/6 |
+| Duplicate source citations | 0 | 0 |
+
+Source identity, budget and branch-restore checks pass. This is a small-window
+configuration stress test, separate from the earlier 32,768 byte-budget comparison.
+All LiteLLM figures are local estimates, without live provider usage.
 
 ## Bugs caught by workloads and regression tests
 
@@ -77,6 +118,11 @@ or a live model are claimed.
    retrieval active for those layouts. Compatible persisted layouts remain reusable.
 7. Native exports contain branch and account fields. Import follows parent links
    and removes host fields rather than concatenating sibling nodes.
+8. A recent-text budget larger than input capacity could fill rebuilt layouts,
+   starving direct recall and causing almost one rebuild per request. Recent
+   selection now respects the rebuild fill target; minimum protected turns can
+   still exceed that soft target. Regression tests also verify a following turn
+   retains its prefix instead of rebuilding immediately.
 
 ## Still unverified
 

@@ -14,7 +14,8 @@
 - 内容、角色及祖先路径共同确定消息版本，支持编辑输入/输出、重生成、回退和分叉。
 - SQLite 持久化不可变快照和独立请求记录；当前路径无法引用其他分支或未来原文。
 - 配置真实价格后，按照持续聊天的重建周期平均费用判断经济重建，不预测用户退出。
-- 潜在公共前缀、估算 token 与模型接口实际返回的缓存用量分别记录。
+- 优先采用同模型、同请求的历史真实输入 token；沿相同前缀追加时，只估算新增部分。
+  计数来源、潜在公共前缀与接口实际返回的缓存用量分别记录。
 
 ## 开发与测试
 
@@ -33,8 +34,20 @@ uv build
 
 Valves 中设置模型上下文容量、回复预留和近期原文预算；`state_path` 应位于持久卷。
 只有配置 `input_price` 和 `cached_input_price`（美元/百万 token）后才启用经济重建。
-默认使用离线 UTF-8 字节估算器；可安装 `lethes[tokenizers]` 后设置合适的 tiktoken encoding。
-图像和音频需另行提供模型专用计数器，本版重点支持文本聊天。
+默认使用离线 UTF-8 字节估算器。推荐安装 wheel 的 `[litellm]` 可选依赖，
+设置 `tokenizer=litellm`；自动采用工作区 `base_model_id`，也可用 `tokenizer_model`
+显式映射部署别名或接口返回的具体版本。未知模型不会静默按 GPT 计数。
+LiteLLM 本地计数覆盖工具定义和工具选择；`response_format` 另按序列化文本预留。
+SDK 计数仍是估算，不调用生成或远程计数接口。离线环境可在启动前设置
+`LITELLM_LOCAL_MODEL_COST_MAP=True`，并准备所选模型需要的本地 tokenizer 资源。
+也可安装 `lethes[tokenizers]` 后设置合适的 tiktoken encoding。本版重点支持文本聊天；
+LiteLLM 的默认图像计数不代表精确多模态预算，字节/tiktoken 后端拒绝图像音频输入。
+
+历史真实 usage 会持久化，重启或切换本地计数器后仍优先使用，但必须匹配模型、
+工具等请求配置和实际组装消息。编辑、分叉或重建后的内容不冒充已测量请求；
+只参考同配置的历史低估量作保守修正。`result.input_tokens` 是预算采用的输入量，
+`count_source` 和 `count_reference` 标明来源及对应请求。真实计数更新不会触发每轮重建；
+只有它使已存布局超出容量等硬约束时才修复布局。
 
 集成依据 2026-11-06 查询的最新官方文档：
 
@@ -43,6 +56,8 @@ Valves 中设置模型上下文容量、回复预留和近期原文预算；`sta
 
 `inlet()` 保留完整历史，跳过标题等内部任务；`request()` 在流水线补充上下文后组装，
 支持工具调用后续请求的幂等处理；`stream()` / `outlet()` 只记录可用的实际 usage。
+优先采用单次 provider 请求计数；工具多跳的整轮汇总保留在日志中，不作为单次请求预算。
+接口返回模型不匹配时停用该路由的旧校准。输出 token 不计入输入量，回复容量独立预留。
 工作区模型提示词及供应商格式转换仍可能在 request 后发生，真实缓存收益需要实测。
 
 ## 后续数据回放
@@ -77,3 +92,5 @@ uv run python examples/export_replay.py --input /path/to/chat-export.json --outp
 导入器按 `parentId` 还原每条分支，最后回到 `currentId`，不会把旁支拼成同一段聊天。
 回放实际用户轮次并验证前缀、输入/输出编辑和恢复。默认使用保守字节估算，
 可通过 `--tokenizer` 指定已经具备本地词表的 tiktoken encoding。
+使用 LiteLLM 可传入 `--tokenizer litellm --tokenizer-model gpt-4o`；离线回放没有真实
+provider usage，此时验证的是 SDK 本地计数下的机制。

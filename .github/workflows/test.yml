@@ -17,3 +17,14 @@ jobs:
       - run: uv run mypy src/lethes --ignore-missing-imports
       - run: uv run pytest --cov=lethes --cov-fail-under=85
       - run: uv build
+  litellm:
+    runs-on: ubuntu-latest
+    env:
+      LITELLM_LOCAL_MODEL_COST_MAP: 'True'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: '3.12'
+      - run: uv sync --extra dev --extra litellm --locked
+      - run: uv run --extra dev --extra litellm pytest tests/test_litellm_sdk.py tests/test_token_counts.py -q
