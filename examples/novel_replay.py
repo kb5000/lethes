@@ -54,10 +54,13 @@ def validate(result, raw: list[dict], limit: int) -> None:
     history = History.from_messages(raw)
     assert result.estimated_tokens <= limit
     assert result.messages[-1] == normalize(raw[-1])
+    quoted: set[int] = set()
     for reminder in result.snapshot.reminders:
         data = json.loads(json.loads(reminder.payload)["content"].split("\n", 1)[1])
         for record in data:
             index = record["message_index"]
+            assert index not in quoted and index < result.snapshot.tail_start
+            quoted.add(index)
             assert index < len(raw)
             assert record["path_revision"] == history.heads[index]
             assert record["message"] == normalize(raw[index])
@@ -156,6 +159,12 @@ async def run(args: argparse.Namespace) -> None:
             "input_limit": manager.config.input_limit,
             "branch_restore": True,
             "raw_passages_validated": True,
+            "duplicate_source_citations": 0,
+            "sum_estimated_input": sum(r["estimated_tokens"] for r in rows),
+            "sum_potential_cached": sum(r["potential_cached_tokens"] for r in rows),
+            "sum_potential_uncached": sum(
+                r["estimated_tokens"] - r["potential_cached_tokens"] for r in rows
+            ),
             "actual_cache_usage": None,
             "tokenizer": getattr(args, "tokenizer", "bytes"),
             "probe_results": probe_rows,

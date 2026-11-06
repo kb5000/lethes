@@ -16,6 +16,10 @@ character state, or a rolling summary.
   There is no small fixed top-k cutoff. Oversized/overflow candidates are reported.
 - **Stable overlays:** a reminder's exact payload and insertion point stay fixed
   throughout its cache cycle. Subsequent messages and reminders are appended.
+- **Reuse before insertion:** recent originals and existing reminders satisfy the
+  current query's recall budget. Already-covered passages are not quoted again,
+  and their slots are not refilled with weaker candidates. Near-tied optional
+  matches prefer resident evidence; direct-query matches retain priority.
 - **Versioned paths:** hashes include content, role and ancestry. Input edits,
   output edits, regeneration, rewinds and branches are ordinary paths, even when
   the host reuses message IDs. Snapshots can only be restored on their own path.

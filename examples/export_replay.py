@@ -19,10 +19,13 @@ def validate(result, raw, limit):
     history = History.from_messages(raw)
     assert result.estimated_tokens <= limit
     assert result.messages[-1] == raw[-1]
+    quoted: set[int] = set()
     for reminder in result.snapshot.reminders:
         excerpts = json.loads(json.loads(reminder.payload)["content"].split("\n", 1)[1])
         for excerpt in excerpts:
             i = excerpt["message_index"]
+            assert i not in quoted and i < result.snapshot.tail_start
+            quoted.add(i)
             assert i < len(raw)
             assert excerpt["message"] == raw[i]
             assert excerpt["path_revision"] == history.heads[i]
@@ -113,6 +116,12 @@ async def run(args):
         "max_estimated_tokens": max(r["estimated_tokens"] for r in rows),
         "input_limit": manager.config.input_limit,
         "original_passages_valid": True,
+        "duplicate_source_citations": 0,
+        "sum_estimated_input": sum(r["estimated_tokens"] for r in rows),
+        "sum_potential_cached": sum(r["potential_cached_tokens"] for r in rows),
+        "sum_potential_uncached": sum(
+            r["estimated_tokens"] - r["potential_cached_tokens"] for r in rows
+        ),
         "stable_prefixes_valid": True,
         "input_output_edit_restore_valid": True,
         "actual_cache_usage": None,

@@ -318,3 +318,149 @@ async def test_full_stable_prefix_rebuilds_to_make_room_for_current_required_rec
     assert second.snapshot.epoch != first.snapshot.epoch
     covered = {i for r in second.snapshot.reminders for s in r.spans for i in s.indices()}
     assert {5, 6} <= covered
+
+
+async def test_resident_hit_does_not_refill_query_budget_with_weaker_candidates(manager, retriever):
+    raw = story()
+    raw[1]["content"] = "a" * 1800
+    raw[3]["content"] = "b" * 1600
+    retriever.spans = (Span(1, 2), Span(3, 4))
+    first = await prepare(manager, raw)
+    assert {i for r in first.snapshot.reminders for s in r.spans for i in s.indices()} == {1}
+    for _ in range(5):
+        raw += [
+            {"role": "assistant", "content": "She nods."},
+            {"role": "user", "content": "Continue the same scene."},
+        ]
+        current = await prepare(manager, raw)
+        assert current.reason == "append"
+        assert current.snapshot.reminders == first.snapshot.reminders
+        assert current.messages[: len(first.messages)] == first.messages
+        assert current.omitted == (Span(3, 4),)
+
+
+async def test_overlapping_recall_and_recent_original_are_never_repeated(manager, retriever):
+    raw = story()
+    retriever.spans = (Span(1, 4), Span(2, 5), Span(3, 6))
+    first = await prepare(manager, raw)
+    raw += [{"role": "assistant", "content": "She nods."}, {"role": "user", "content": "Continue."}]
+    retriever.spans = (Span(2, 5), Span(1, 4), Span(3, 7))
+    current = await prepare(manager, raw)
+    quoted = [i for r in current.snapshot.reminders for s in r.spans for i in s.indices()]
+    assert len(quoted) == len(set(quoted))
+    assert not set(quoted).intersection(range(current.snapshot.tail_start, len(raw)))
+    assert current.messages[: len(first.messages)] == first.messages
+
+
+async def test_recall_of_a_message_still_in_continuous_tail_is_not_requoted(manager, retriever):
+    raw = story()
+    retriever.spans = ()
+    first = await prepare(manager, raw)
+    recalled = first.snapshot.tail_start
+    retriever.spans = (Span(recalled, recalled + 1),)
+    raw += [
+        {"role": "assistant", "content": "An extended answer. " * 15},
+        {"role": "user", "content": "She keeps walking."},
+    ]
+    current = await prepare(manager, raw)
+    assert current.snapshot.reminders == ()
+    assert current.messages[: len(first.messages)] == first.messages
+    assert current.omitted == ()
+
+
+async def test_edit_of_previously_quoted_source_is_not_suppressed_as_already_seen(
+    manager, retriever
+):
+    raw = story()
+    raw[1]["id"] = "unchanged-id"
+    raw[1]["content"] = "The gate only opens during rain."
+    first = await prepare(manager, raw)
+    edited = copy.deepcopy(raw)
+    edited[1]["content"] = "The gate only opens at night."
+    second = await prepare(manager, edited)
+    assert "The gate only opens at night." in str(second.messages)
+    assert "The gate only opens during rain." not in str(second.messages)
+    assert second.snapshot.epoch != first.snapshot.epoch
+
+
+async def test_tool_hop_does_not_run_retrieval_again(manager, retriever):
+    raw = story()
+    first = await prepare(manager, raw)
+    calls = retriever.calls
+    raw += [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "roll", "type": "function", "function": {"name": "roll", "arguments": "{}"}}
+            ],
+        },
+        {"role": "tool", "tool_call_id": "roll", "content": "20"},
+    ]
+    current = await prepare(manager, raw)
+    assert retriever.calls == calls
+    assert current.messages[: len(first.messages)] == first.messages
+
+
+@pytest.mark.parametrize(
+    "scores,required,expected",
+    [
+        ((1.0, 0.89), (), 1),
+        ((1.0, 0.8), (), 0),
+        ((0.01, 1.0), (Span(1, 2),), 0),
+    ],
+)
+def test_resident_preference_is_bounded_and_cannot_override_required_match(
+    scores, required, expected
+):
+    from lethes import Retrieval
+    from lethes.engine import stable_recall_order
+
+    search = Retrieval((Span(1, 2), Span(3, 4)), focuses=(1, 3), scores=scores, required=required)
+    assert stable_recall_order(search, {3})[0] == expected
+
+
+@pytest.mark.parametrize("scores", [(float("nan"),), (-1.0,), (1.0, 2.0)])
+async def test_invalid_retrieval_scores_are_rejected(manager, scores):
+    from lethes import Retrieval
+
+    class Invalid:
+        async def search(self, history, before):
+            return Retrieval((Span(1, 2),), scores=scores)
+
+    manager.retriever = Invalid()
+    with pytest.raises(ValueError, match="scores"):
+        await prepare(manager, story())
+
+
+async def test_compatible_saved_layout_is_replayed_without_cold_reset():
+    from dataclasses import asdict
+
+    from lethes.history import canonical
+    from lethes.state import Snapshot
+
+    raw = [
+        {"role": "system", "content": "Continue the story."},
+        {"role": "user", "content": "She opens the door."},
+    ]
+    manager = ContextManager()
+    history = History.from_messages(raw)
+    # The earlier alpha's persisted domain contract and snapshot format remain valid.
+    old_domain = digest(
+        ["default", "default", {}, asdict(manager.config), None, manager.counter.cache_identity, 0]
+    )
+    legacy = Snapshot(
+        history.head,
+        len(history),
+        "existing-cycle",
+        1,
+        (),
+        tuple(canonical(m) for m in raw),
+        manager.counter.count(raw),
+        512,
+    )
+    manager.store.save(digest(["u", "chat"]), old_domain, legacy)
+    result = await prepare(manager, raw)
+    assert result.reason == "replay"
+    assert result.snapshot.epoch == "existing-cycle"
+    assert result.messages == raw

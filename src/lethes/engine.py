@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import json
+import math
 import uuid
 from dataclasses import asdict, dataclass, replace
 
 from .costs import CachePricing, RenewalPolicy, parse_usage
 from .history import History, Message, canonical, digest
-from .retrieval import HybridRetriever, Retriever
+from .retrieval import HybridRetriever, Retrieval, Retriever
 from .state import ContextResult, Reminder, Snapshot, Span
 from .store import SQLiteStore
 from .tokens import ByteTokenCounter, TokenCounter, common_prefix_tokens
@@ -89,6 +90,36 @@ def assemble(history: History, tail_start: int, reminders: tuple[Reminder, ...])
     return result
 
 
+def covered_indices(snapshot: Snapshot, length: int) -> set[int]:
+    return set(range(snapshot.tail_start, length)) | {
+        i for r in snapshot.reminders for span in r.spans for i in span.indices()
+    }
+
+
+def stable_recall_order(search: Retrieval, resident: set[int]) -> tuple[int, ...]:
+    """Keep mandatory hits first; prefer resident evidence within a 15% score band.
+
+    This only reorders the same candidate set. A substantially stronger new match
+    still outranks old optional evidence, and explicit current-query hits are protected.
+    """
+    if not search.scores:
+        return tuple(range(len(search.spans)))
+    if len(search.scores) != len(search.spans) or any(
+        not math.isfinite(s) or s < 0 for s in search.scores
+    ):
+        raise ValueError("Invalid retrieval scores")
+
+    def priority(i: int) -> tuple[bool, float, int]:
+        span = search.spans[i]
+        focus_covered = (
+            search.focuses[i] in resident if search.focuses else set(span.indices()) <= resident
+        )
+        score = search.scores[i] * (1.15 if focus_covered else 1)
+        return span not in search.required, -score, i
+
+    return tuple(sorted(range(len(search.spans)), key=priority))
+
+
 class ContextManager:
     def __init__(
         self,
@@ -106,6 +137,83 @@ class ContextManager:
         self.counter = counter or ByteTokenCounter()
         self.pricing = pricing
         self.namespace = namespace
+
+    def _growth(
+        self, history: History, previous: Snapshot, raw_tokens: int, wire_tokens: int | None = None
+    ) -> float:
+        turns = sum(m["role"] == "user" for m in history.messages[previous.history_length :])
+        if not turns:
+            return previous.growth
+        delta = (
+            raw_tokens - previous.raw_tokens
+            if wire_tokens is None
+            else wire_tokens - self.counter.count(previous.messages)
+        )
+        return 0.5 * previous.growth + 0.5 * max(1, delta / turns)
+
+    def _extend(
+        self,
+        history: History,
+        previous: Snapshot,
+        desired: Snapshot | None,
+        raw_tokens: int,
+        limit: int,
+    ) -> Snapshot:
+        """Reconcile a bounded query working set against immutable resident context.
+
+        Already-resident evidence satisfies the query's budget; it is not free
+        space that should be refilled with lower-ranked historical candidates.
+        """
+        reminders = previous.reminders
+        base = assemble(history, previous.tail_start, reminders)
+        if self.counter.count(base) > limit:
+            raise ContextOverflow("Continuous current turn and instructions exceed input budget")
+        covered = covered_indices(previous, len(history))
+        requested = (
+            {i for r in desired.reminders for s in r.spans for i in s.indices()}
+            if desired
+            else set()
+        )
+        missing = requested - covered
+        selected: set[int] = set()
+        anchor = history.turn_starts()[-1] if history.turn_starts() else len(history) - 1
+        if missing:
+            assert desired is not None
+            # Try all desired additions together first, then required ranges and
+            # remaining contiguous ranges. Existing reminders never move or change.
+            groups = [intervals(missing)]
+            groups += [(s,) for s in (*desired.required, *intervals(missing))]
+            for group in groups:
+                addition = {i for s in group for i in s.indices()} & missing - selected
+                if not addition:
+                    continue
+                proposed = selected | addition
+                overlay = reminder(history, intervals(proposed), anchor)
+                candidate = assemble(history, previous.tail_start, reminders + (overlay,))
+                if self.counter.count(candidate) <= limit:
+                    selected = proposed
+        if selected:
+            reminders += (reminder(history, intervals(selected), anchor),)
+        messages = assemble(history, previous.tail_start, reminders)
+        omitted = {
+            i for s in (desired.omitted if desired else previous.omitted) for i in s.indices()
+        }
+        omitted |= requested - selected
+        omitted -= covered | selected
+        return Snapshot(
+            history.head,
+            len(history),
+            previous.epoch,
+            previous.tail_start,
+            reminders,
+            tuple(canonical(m) for m in messages),
+            raw_tokens,
+            self._growth(history, previous, raw_tokens, self.counter.count(messages)),
+            previous.epoch_turns + 1,
+            intervals(omitted),
+            desired.warnings if desired else previous.warnings,
+            desired.required if desired else previous.required,
+        )
 
     def _tail_start(self, history: History, limit: int) -> int:
         messages = history.messages
@@ -131,33 +239,26 @@ class ContextManager:
                 selected = min(selected, i)
         return selected
 
-    async def _build(
+    async def _plan(
         self,
         history: History,
-        previous: Snapshot | None,
         raw_tokens: int,
         limit: int,
         *,
         compact: bool = False,
-    ) -> tuple[Snapshot, tuple[Span, ...], tuple[str, ...]]:
-        if previous:
-            start, reminders = previous.tail_start, previous.reminders
-        elif not compact and raw_tokens <= int(limit * self.config.rebuild_fill):
-            start, reminders = history.instruction_count, ()
+        resident: set[int] | None = None,
+    ) -> Snapshot:
+        reminders: tuple[Reminder, ...] = ()
+        if not compact and raw_tokens <= int(limit * self.config.rebuild_fill):
+            start = history.instruction_count
         else:
-            start, reminders = self._tail_start(history, limit), ()
+            start = self._tail_start(history, limit)
         messages = assemble(history, start, reminders)
         if self.counter.count(messages) > limit:
             raise ContextOverflow("Continuous current turn and instructions exceed input budget")
-        # First/rebuilt cycles reserve room to grow; continuation can use all remaining capacity.
-        target = (
-            limit
-            if previous
-            else max(self.counter.count(messages), int(limit * self.config.rebuild_fill))
-        )
+        # Reference query budget is independent of how much context is resident.
+        target = max(self.counter.count(messages), int(limit * self.config.rebuild_fill))
         covered = set(range(start, len(history)))
-        for item in reminders:
-            covered.update(i for span in item.spans for i in span.indices())
         search = await self.retriever.search(history, start)
         selected: set[int] = set()
         omitted: set[int] = set()
@@ -166,17 +267,12 @@ class ContextManager:
         starts = history.turn_starts()
         if starts:
             anchor = starts[-1]
-        # A follow-up within that same turn must append at its tail to keep sent bytes stable.
-        if previous and anchor < previous.history_length:
-            anchor = len(history) - 1
-            if history.messages[anchor]["role"] in {"tool", "function"}:
-                # Defer retrieval inside an active tool exchange. Existing reminders stay intact.
-                search = replace(search, spans=(), focuses=(), required=())
         if any(s not in search.spans for s in search.required):
             raise ValueError("Required retrieval range is absent from candidates")
         if search.focuses and len(search.focuses) != len(search.spans):
             raise ValueError("Retriever focus count does not match spans")
-        for position, span in enumerate(search.spans):
+        for position in stable_recall_order(search, resident or set()):
+            span = search.spans[position]
             if not history.instruction_count <= span.start < span.end <= start:
                 raise ValueError("Retriever returned a span outside visible earlier history")
             additional = set(span.indices()) - covered - selected
@@ -205,36 +301,21 @@ class ContextManager:
         if selected:
             reminders += (reminder(history, intervals(selected), anchor),)
         wire = tuple(canonical(m) for m in assemble(history, start, reminders))
-        growth = self.config.initial_growth if previous is None else previous.growth
-        if previous and len(history) > previous.history_length:
-            new_turns = sum(
-                m["role"] == "user" for m in history.messages[previous.history_length :]
-            )
-            if new_turns:
-                delta = (
-                    max(
-                        1,
-                        self.counter.count([json.loads(p) for p in wire])
-                        - self.counter.count(previous.messages),
-                    )
-                    / new_turns
-                )
-                growth = previous.growth * 0.5 + delta * 0.5
         snapshot = Snapshot(
             history.head,
             len(history),
-            previous.epoch if previous else uuid.uuid4().hex,
+            uuid.uuid4().hex,
             start,
             reminders,
             wire,
             raw_tokens,
-            growth,
-            previous.epoch_turns + 1 if previous else 1,
+            self.config.initial_growth,
+            1,
             intervals(omitted - selected),
             search.warnings,
             search.required,
         )
-        return snapshot, intervals(omitted - selected), search.warnings
+        return snapshot
 
     async def prepare(
         self,
@@ -278,46 +359,54 @@ class ContextManager:
             )
 
         raw_tokens = self.counter.count(history.messages)
-        omitted: tuple[Span, ...] = ()
-        warnings: tuple[str, ...] = ()
         economics: dict[str, float] = {}
         if previous and previous.head == history.head:
             snapshot, reason = previous, "replay"
         else:
             reason = "initial" if previous is None else "append"
-            try:
-                snapshot, omitted, warnings = await self._build(
-                    history, previous, raw_tokens, limit
-                )
-            except ContextOverflow:
-                if previous is None:
-                    raise
-                snapshot, omitted, warnings = await self._build(history, None, raw_tokens, limit)
-                reason = "capacity"
-            coverage_required = {i for s in snapshot.required for i in s.indices()}
-            coverage_present = set(range(snapshot.tail_start, len(history))) | {
-                i for r in snapshot.reminders for s in r.spans for i in s.indices()
-            }
             candidate = None
-            if previous and reason == "append" and coverage_required - coverage_present:
-                candidate, candidate_omitted, candidate_warnings = await self._build(
-                    history, None, raw_tokens, limit, compact=True
-                )
-                candidate_coverage = set(range(candidate.tail_start, len(history))) | {
-                    i for r in candidate.reminders for s in r.spans for i in s.indices()
-                }
-                if coverage_required <= candidate_coverage:
-                    snapshot, omitted, warnings = candidate, candidate_omitted, candidate_warnings
-                    snapshot = replace(snapshot, growth=previous.growth)
-                    reason = "recall_capacity"
-            if previous and reason == "append" and self.pricing:
-                candidate, candidate_omitted, candidate_warnings = await self._build(
+            has_new_user = previous is None or any(
+                m["role"] == "user" for m in history.messages[previous.history_length :]
+            )
+            if has_new_user:
+                candidate = await self._plan(
                     history,
-                    None,
                     raw_tokens,
                     limit,
-                    compact=True,
+                    compact=previous is not None
+                    and previous.tail_start > history.instruction_count,
+                    resident=covered_indices(previous, len(history)) if previous else None,
                 )
+            if previous is None:
+                assert candidate is not None
+                snapshot = candidate
+            else:
+                try:
+                    snapshot = self._extend(history, previous, candidate, raw_tokens, limit)
+                except ContextOverflow:
+                    if candidate is None:
+                        candidate = await self._plan(history, raw_tokens, limit)
+                    snapshot = replace(
+                        candidate, growth=self._growth(history, previous, raw_tokens)
+                    )
+                    reason = "capacity"
+                required_indices = {i for s in snapshot.required for i in s.indices()}
+                if candidate and required_indices - covered_indices(snapshot, len(history)):
+                    if required_indices <= covered_indices(candidate, len(history)):
+                        snapshot = replace(
+                            candidate, growth=self._growth(history, previous, raw_tokens)
+                        )
+                        reason = "recall_capacity"
+            if previous and reason == "append" and self.pricing and has_new_user:
+                assert candidate is not None
+                if candidate.tail_start == history.instruction_count:
+                    candidate = await self._plan(
+                        history,
+                        raw_tokens,
+                        limit,
+                        compact=True,
+                        resident=covered_indices(previous, len(history)),
+                    )
                 # Economics must not achieve savings by discarding today's recalled passages.
                 required = {
                     i
@@ -326,9 +415,7 @@ class ContextManager:
                     for s in r.spans
                     for i in s.indices()
                 }
-                available = set(range(candidate.tail_start, len(history))) | {
-                    i for r in candidate.reminders for s in r.spans for i in s.indices()
-                }
+                available = covered_indices(candidate, len(history))
                 if required <= available:
                     decision = RenewalPolicy(self.pricing, self.config.economic_margin).decide(
                         old_tokens=self.counter.count(snapshot.messages) + extra_tokens,
@@ -345,12 +432,9 @@ class ContextManager:
                         "rebuild_excess": decision.rebuild_excess,
                     }
                     if decision.rebuild:
-                        snapshot, omitted, warnings = (
-                            candidate,
-                            candidate_omitted,
-                            candidate_warnings,
+                        snapshot = replace(
+                            candidate, growth=self._growth(history, previous, raw_tokens)
                         )
-                        snapshot = replace(snapshot, growth=previous.growth)
                         reason = "economic"
         snapshot = self.store.save(scope, domain, snapshot)
         omitted, warnings = snapshot.omitted, snapshot.warnings

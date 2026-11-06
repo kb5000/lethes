@@ -36,6 +36,7 @@ class Retrieval:
     warnings: tuple[str, ...] = ()
     focuses: tuple[int, ...] = ()
     required: tuple[Span, ...] = ()
+    scores: tuple[float, ...] = ()
 
 
 class Retriever(Protocol):
@@ -96,6 +97,13 @@ class HybridRetriever:
         # chunks must not outvote that question merely by producing more rankings.
         weights = {q: 0.5 for q in recent + ["\n".join(recent)] if q.strip()}
         latest_user = next((text(m) for m in reversed(recent_messages) if m["role"] == "user"), "")
+        wants_earliest = bool(
+            re.search(
+                r"最初|最早|最开始|earliest|first mention|originally|at the beginning",
+                latest_user,
+                re.IGNORECASE,
+            )
+        )
         if latest_user.strip() and latest_user.strip().casefold() not in continuations:
             weights[latest_user] = 4.0
         warnings = []
@@ -132,6 +140,11 @@ class HybridRetriever:
                 if rank == 0 and query == latest_user:
                     primary_hits.append(index)
                 ranks[index] = ranks.get(index, 0) + weights[query] / (20 + rank)
+            if query == latest_user and wants_earliest and scores:
+                # Temporal intent changes which original passage is needed, not its
+                # factual interpretation. Keep the best match and an early strong match.
+                floor = max(score for score, _ in scores) * (2 / 3)
+                primary_hits.append(min(i for score, i in scores if score >= floor))
         if self.embedder:
             try:
                 dense_docs = [(i, d) for i, d in enumerate(docs) if d.strip()]
@@ -172,4 +185,10 @@ class HybridRetriever:
             )
             for i in dict.fromkeys(primary_hits)
         )
-        return Retrieval(spans, tuple(warnings), tuple(first + i for i in ordered), required)
+        return Retrieval(
+            spans,
+            tuple(warnings),
+            tuple(first + i for i in ordered),
+            required,
+            tuple(ranks[i] for i in ordered),
+        )

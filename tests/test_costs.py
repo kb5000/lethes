@@ -124,3 +124,35 @@ async def test_manager_applies_economic_rebuild_to_bloated_prefix():
     assert second.reason == "economic"
     assert second.snapshot.epoch != first.snapshot.epoch
     assert second.economics["keep_excess"] > second.economics["rebuild_excess"]
+
+
+async def test_economically_compacted_short_history_still_queries_omitted_originals():
+    from conftest import ScriptedRetriever, prepare
+
+    from lethes import ContextConfig, ContextManager, Span
+
+    manager = ContextManager(
+        ContextConfig(
+            context_window=12000,
+            reply_reserve=500,
+            safety_reserve=200,
+            recent_tokens=500,
+            minimum_recent_turns=1,
+        ),
+        pricing=CachePricing(10, 5, 0, 1),
+        retriever=ScriptedRetriever(),
+    )
+    original = "The original setting. " * 320
+    raw = [{"role": "user", "content": original}]
+    await prepare(manager, raw)
+    raw += [{"role": "assistant", "content": "Done."}, {"role": "user", "content": "New scene."}]
+    compacted = await prepare(manager, raw)
+    assert compacted.reason == "economic"
+    assert original not in str(compacted.messages)
+    manager.retriever = ScriptedRetriever((Span(0, 1),))
+    raw += [
+        {"role": "assistant", "content": "She nods."},
+        {"role": "user", "content": "Recall the original setting."},
+    ]
+    recalled = await prepare(manager, raw)
+    assert original in str(recalled.messages)

@@ -1,6 +1,7 @@
 import httpx
 import pytest
 
+from lethes import Span
 from lethes.history import History
 from lethes.providers import OpenAIEmbeddings, OpenAIQueryExpander
 from lethes.retrieval import HybridRetriever, terms
@@ -139,3 +140,17 @@ async def test_generic_continue_messages_are_not_retrieval_centers():
     result = await HybridRetriever(neighbors=0).search(h, 3)
     assert result.spans
     assert all(s.start == 1 for s in result.spans)
+
+
+async def test_earliest_request_keeps_strong_original_beside_later_repetitions():
+    history = History.from_messages(
+        [
+            {"role": "assistant", "content": "铜镜使用时需要献出记忆。"},
+            {"role": "assistant", "content": "旅人在城外过夜。"},
+            {"role": "assistant", "content": "铜镜使用记忆，铜镜需要记忆，铜镜依靠记忆。"},
+            {"role": "user", "content": "最初提到铜镜时，使用铜镜需要什么？"},
+        ]
+    )
+    result = await HybridRetriever(neighbors=0).search(history, 3)
+    assert Span(0, 1) in result.required
+    assert result.focuses.index(0) < 2

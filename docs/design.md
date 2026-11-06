@@ -42,6 +42,33 @@ small fixed top-k truncation is applied. Budget selection deduplicates original
 indices and merges adjacent spans. Reminders serialize exact original message
 content, speaker, index and path revision inside a historical-data wrapper.
 
+Each query first has a bounded **reference working set**, independent of free
+space in the accumulated prefix. That working set is then reconciled against
+the continuous original tail and existing reminders: only missing source indices
+can be added. Resident passages consume the reference recall budget even when
+their incremental insertion cost is zero. Otherwise the selector would skip
+covered candidates as "free" and append the next batch of weaker matches on
+every turn, repeatedly exhausting capacity for essentially the same query.
+
+Optional candidates whose relevance is close receive a bounded 15% score bonus
+when their focus is already resident. Required direct-query matches remain first;
+substantially stronger new evidence can still outrank old optional evidence.
+Explicit earliest/original-mention queries retain both the strongest match and
+an early match with at least two-thirds of its lexical score. These are retrieval
+ordering choices, not fictional-rule extraction. Candidate sets remain intact.
+
+Coverage is checked by source index and content-versioned ancestry. Overlapping
+ranges contribute only their missing portion, including when one part is already
+present in continuous raw dialogue. Similar statements from distinct events or
+revisions are not merged into a guessed fact. Replay validates that no source
+index is quoted twice or quoted alongside its already-present continuous original.
+
+Tool follow-up hops without a new user turn extend the saved layout without
+calling retrieval again. Compatible existing snapshot/domain formats are reused
+across this optimization; there is no forced cache reset. Growth measurements
+survive rebuilding. Previously compacted histories still query omitted passages
+even when their complete raw input would fit a new cold layout.
+
 Oversized message-level candidates may not fit; `omitted` reports these ranges.
 This alpha retrieves whole messages plus neighbors, not character-offset snippets.
 No approach guarantees implicit recall without a relevant cue. Real datasets must
