@@ -1,55 +1,24 @@
-"""
-lethes — Constraint-driven LLM context management library.
+"""lethes v2: original-text recall with branch-aware, cache-stable context."""
 
-Quick start::
+from .costs import CachePricing, RenewalPolicy
+from .engine import ContextConfig, ContextManager, ContextOverflow
+from .retrieval import HybridRetriever, Retrieval
+from .state import ContextResult, Span
+from .store import SQLiteStore
+from .tokens import ByteTokenCounter, TiktokenCounter
 
-    from lethes import ContextOrchestrator, Conversation, TokenBudget
-    from lethes.algorithms import GreedyByWeightAlgorithm
-    from lethes.weighting import KeywordRelevanceStrategy
-
-    orchestrator = ContextOrchestrator(
-        budget=TokenBudget(max_tokens=8000),
-        algorithm=GreedyByWeightAlgorithm(),
-        weighting=KeywordRelevanceStrategy(),
-    )
-
-    result = await orchestrator.process(
-        Conversation.from_openai_messages(raw_messages)
-    )
-    ready_messages = result.conversation.to_openai_messages()
-
-Open WebUI integration::
-
-    from lethes.integrations.open_webui import OpenWebUIFilter as Filter
-"""
-
-from .engine.constraints import ConstraintViolation
-from .engine.orchestrator import ContextOrchestrator, OrchestratorResult
-from .observability import configure_logging
-from .models.budget import Budget, CompositeBudget, CostBudget, TokenBudget, TokenTargetBudget
-from .models.conversation import Conversation
-from .models.message import Message
-from .models.pricing import ModelPricingEntry, ModelPricingTable
-
+__version__ = "2.0.0a1"
 __all__ = [
-    # Observability
-    "configure_logging",
-    # Core
-    "ContextOrchestrator",
-    "Conversation",
-    "Message",
-    "OrchestratorResult",
-    # Budgets
-    "Budget",
-    "CompositeBudget",
-    "CostBudget",
-    "TokenBudget",
-    "TokenTargetBudget",
-    # Engine
-    "ConstraintViolation",
-    # Pricing
-    "ModelPricingEntry",
-    "ModelPricingTable",
+    "ByteTokenCounter",
+    "CachePricing",
+    "ContextConfig",
+    "ContextManager",
+    "ContextOverflow",
+    "ContextResult",
+    "HybridRetriever",
+    "RenewalPolicy",
+    "Retrieval",
+    "SQLiteStore",
+    "Span",
+    "TiktokenCounter",
 ]
-
-__version__ = "0.1.0"

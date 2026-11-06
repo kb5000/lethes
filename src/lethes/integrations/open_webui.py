@@ -1,357 +1,324 @@
-"""
-Open WebUI Filter integration — drop-in replacement for example.py's Filter.
+"""Open WebUI Filter contract checked against official docs on 2026-11-06.
 
-Usage in Open WebUI:
-
-    from lethes.integrations.open_webui import OpenWebUIFilter as Filter
-
-Or copy just this file into your Open WebUI functions directory.
+Assembly runs in request(), after pipeline enrichment, on every provider hop.
+No per-chat mutable telemetry lives on the shared Filter instance.
 """
 
 from __future__ import annotations
 
+import copy
+import json
 import logging
-import time
-from typing import Any, Awaitable, Callable, Literal, Optional
+from collections.abc import Awaitable, Callable
+from dataclasses import asdict
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SecretStr
 
-from ..algorithms.dependency import DependencyAwareAlgorithm
-from ..algorithms.greedy import GreedyByWeightAlgorithm
-from ..algorithms.recency import RecencyBiasedAlgorithm
-from ..cache.memory_backend import InMemoryCache
-from ..cache.redis_backend import RedisCache
-from ..engine.constraints import ConstraintSet
-from ..engine.orchestrator import ContextOrchestrator
-from ..models.budget import TokenBudget
-from ..models.conversation import Conversation
-from ..models.pricing import ModelPricingTable
-from ..summarizers.levels import TurnSummarizer
-from ..summarizers.llm import LLMSummarizer
-from ..utils.tokens import TokenCounter
-from ..weighting.composite import CompositeWeightStrategy
-from ..weighting.keyword import KeywordRelevanceStrategy
-from ..weighting.llm_analyzer import LLMContextAnalyzer
-from ..weighting.smart import SmartWeightingStrategy
-from ..weighting.static import StaticWeightStrategy
+from lethes.costs import CachePricing
+from lethes.engine import ContextConfig, ContextManager
+from lethes.history import canonical, digest, normalize
+from lethes.providers import OpenAIEmbeddings, OpenAIQueryExpander
+from lethes.retrieval import HybridRetriever
+from lethes.store import SQLiteStore
+from lethes.tokens import ByteTokenCounter, TiktokenCounter
 
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
+Emitter = Callable[[dict], Awaitable[None]]
+
+
+def is_prefix(prefix: list[dict], messages: list[dict]) -> bool:
+    return len(prefix) <= len(messages) and all(
+        canonical(normalize(a)) == canonical(normalize(b))
+        for a, b in zip(prefix, messages, strict=False)
+    )
+
+
+def instruction_count(messages: list[dict]) -> int:
+    count = 0
+    for message in messages:
+        if message.get("role") not in {"system", "developer"}:
+            break
+        count += 1
+    return count
 
 
 class OpenWebUIFilter:
-    """
-    Plug-and-play Open WebUI filter that wraps :class:`~lethes.engine.orchestrator.ContextOrchestrator`.
-
-    Configure via the ``Valves`` inner class (exposed by Open WebUI's settings UI).
-    """
-
     class Valves(BaseModel):
-        priority: int = Field(default=0, description="Filter execution priority")
-        max_tokens: int = Field(
-            default=10_000,
-            description="Token limit for the context window. 0 = unlimited.",
-        )
-        max_turns: int = Field(
-            default=25,
-            description="Max conversation turns to keep. 0 = unlimited.",
-        )
-        algorithm: Literal[
-            "greedy_by_weight",
-            "recency_biased",
-            "dependency_aware",
-        ] = Field(
-            default="recency_biased",
-            description=(
-                "Context selection algorithm. "
-                "'recency_biased' (default) prioritises recent messages; "
-                "'greedy_by_weight' picks by relevance score alone; "
-                "'dependency_aware' enforces explicit dependency chains."
-            ),
-        )
-        recency_factor: float = Field(
-            default=1.5,
-            description=(
-                "Recency bias strength for 'recency_biased' algorithm. "
-                "0 = no bias; 1.5 = newest message has 2.5× the weight of oldest. "
-                "Increase for stronger recency preference."
-            ),
-        )
-        weighting: Literal["static", "keyword", "smart"] = Field(
-            default="smart",
-            description=(
-                "Message relevance weighting strategy. "
-                "'smart' (default) combines keyword relevance, Q&A pair coherence, "
-                "and tool-call penalties. "
-                "'keyword' uses BM25/overlap only. "
-                "'static' disables relevance scoring."
-            ),
-        )
-        tool_penalty: float = Field(
-            default=0.5,
-            description=(
-                "Weight multiplier for tool-call intermediate messages "
-                "(role='tool' or assistant messages with tool_calls). "
-                "0.5 = half the weight of regular messages. 1.0 = no penalty."
-            ),
-        )
-        pair_coherence: float = Field(
-            default=0.8,
-            description=(
-                "Fraction of a user message's relevance score transferred to its "
-                "following assistant reply (0.0 – 1.0). "
-                "Higher values keep Q&A pairs together more aggressively."
-            ),
-        )
-        # ── Summarisation ─────────────────────────────────────────────────
-        summary_api_base: str = Field(
-            default="https://api.openai.com/v1",
-            description="OpenAI-compatible API base URL for summarisation",
-        )
-        summary_api_key: str = Field(default="", description="API key for summarisation model")
-        summary_model: str = Field(default="gpt-4o-mini", description="Model used for summarisation")
-        summary_target_ratio: float = Field(default=0.3, description="Summarisation compression ratio")
-        retry_attempts: int = Field(default=3, description="Retry attempts for summarisation")
-        nosum_by_default: bool = Field(default=False, description="Disable summarisation globally")
-        # ── LLM context analyser (sub-agent) ──────────────────────────────
-        llm_analysis: bool = Field(
-            default=False,
-            description=(
-                "Enable LLM-powered context analysis (sub-agent). "
-                "When enabled, a fast LLM scores each message's importance for "
-                "the current query. Uses summary_api_key and summary_model. "
-                "Adds ~200–400 ms latency; results are cached."
-            ),
-        )
-        llm_analysis_weight: float = Field(
-            default=0.6,
-            description=(
-                "Weight of the LLM analysis score in the composite weighting "
-                "(1 − llm_analysis_weight goes to the base weighting strategy). "
-                "Only used when llm_analysis=True."
-            ),
-        )
-        # ── Cache ─────────────────────────────────────────────────────────
-        cache_backend: Literal["memory", "redis"] = Field(
-            default="memory", description="Cache backend for summaries and embeddings"
-        )
-        redis_url: str = Field(
-            default="redis://redis:6379/0", description="Redis URL (only used with redis cache)"
-        )
-        pricing_config_path: str = Field(
-            default="",
-            description=(
-                "Path to a custom pricing JSON file. "
-                "Leave empty to use OpenRouter live pricing (recommended) "
-                "or no pricing if openrouter_pricing is also disabled."
-            ),
-        )
-        openrouter_pricing: bool = Field(
-            default=True,
-            description=(
-                "Fetch live model pricing from OpenRouter at startup. "
-                "Enables cost estimation in logs. "
-                "Set to False to disable (e.g. in offline/air-gapped environments)."
-            ),
-        )
+        priority: int = Field(default=100, description="Run after other context-changing filters")
+        state_path: str = Field(default="/app/backend/data/lethes/state.sqlite3")
+        context_window: int = Field(default=32768, gt=0)
+        reply_reserve: int = Field(default=4096, ge=0)
+        safety_reserve: int = Field(default=1024, ge=0)
+        recent_tokens: int = Field(default=8192, gt=0)
+        minimum_recent_turns: int = Field(default=2, gt=0)
+        rebuild_fill: float = Field(default=0.75, gt=0, lt=1)
+        tokenizer: str = Field(default="bytes", description="bytes or a tiktoken encoding name")
+        input_price: float | None = Field(default=None, ge=0, description="USD per million tokens")
+        cached_input_price: float | None = Field(default=None, ge=0)
+        cache_minimum: int = Field(default=1024, ge=0)
+        cache_block: int = Field(default=128, gt=0)
+        cache_ttl_seconds: float = Field(default=300, gt=0)
+        embedding_api_base: str = "https://api.openai.com/v1"
+        embedding_api_key: SecretStr = SecretStr("")
+        embedding_model: str = ""
+        query_api_base: str = "https://api.openai.com/v1"
+        query_api_key: SecretStr = SecretStr("")
+        query_model: str = ""
 
     def __init__(self) -> None:
         self.valves = self.Valves()
-        self._orchestrator: ContextOrchestrator | None = None
-        self._orchestrator_config_key: tuple | None = None
-        self._pricing_table: ModelPricingTable | None = None
-        # Telemetry
-        self._input_tokens: int = 0
-        self._output_tokens: int = 0
-        self._start_time: float | None = None
-        self._user: str = "unknown"
-        self._model_id: str = "unknown"
-        self._input_message_count: int = 0
+        self.toggle = True
+        self._manager: ContextManager | None = None
+        self._config_key = ""
 
-    # ── Open WebUI hooks ──────────────────────────────────────────────────
+    def _get_manager(self) -> ContextManager:
+        config = self.valves.model_dump(mode="json")
+        # SecretStr serialization masks values; hash actual secrets for invalidation, never log.
+        config["embedding_api_key"] = digest(self.valves.embedding_api_key.get_secret_value())
+        config["query_api_key"] = digest(self.valves.query_api_key.get_secret_value())
+        key = digest(config)
+        if self._manager is not None and key == self._config_key:
+            return self._manager
+        valves = self.valves
+        pricing = None
+        if valves.input_price is not None and valves.cached_input_price is not None:
+            pricing = CachePricing(
+                valves.input_price,
+                valves.cached_input_price,
+                valves.cache_minimum,
+                valves.cache_block,
+                valves.cache_ttl_seconds,
+            )
+        embedder = (
+            OpenAIEmbeddings(
+                valves.embedding_api_base,
+                valves.embedding_api_key.get_secret_value(),
+                valves.embedding_model,
+            )
+            if valves.embedding_model
+            else None
+        )
+        expander = (
+            OpenAIQueryExpander(
+                valves.query_api_base, valves.query_api_key.get_secret_value(), valves.query_model
+            )
+            if valves.query_model
+            else None
+        )
+        manager = ContextManager(
+            ContextConfig(
+                context_window=valves.context_window,
+                reply_reserve=valves.reply_reserve,
+                safety_reserve=valves.safety_reserve,
+                recent_tokens=valves.recent_tokens,
+                minimum_recent_turns=valves.minimum_recent_turns,
+                rebuild_fill=valves.rebuild_fill,
+            ),
+            store=SQLiteStore(valves.state_path),
+            retriever=HybridRetriever(embedder=embedder, expander=expander),
+            pricing=pricing,
+            counter=ByteTokenCounter()
+            if valves.tokenizer == "bytes"
+            else TiktokenCounter(valves.tokenizer),
+            namespace=key,
+        )
+        # Do not close the previous manager while an in-flight request may still use it.
+        self._manager, self._config_key = manager, key
+        return manager
+
+    @staticmethod
+    def _metadata(body: dict, metadata: dict | None) -> dict:
+        if metadata is not None:
+            return metadata
+        if not isinstance(body.get("metadata"), dict):
+            body["metadata"] = {}
+        return body["metadata"]
+
+    @staticmethod
+    def _key(function_id: str | None) -> str:
+        return f"_lethes_v2_{function_id or 'default'}"
+
+    @staticmethod
+    def _correlation(metadata: dict, user: dict | None, body: dict) -> str:
+        chat = metadata.get("chat_id") or body.get("chat_id")
+        message = metadata.get("message_id") or body.get("id")
+        if not chat or not message:
+            return ""
+        return digest(
+            [(user or {}).get("id") or metadata.get("user_id"), chat, message, body.get("model")]
+        )
 
     async def inlet(
         self,
         body: dict,
-        __event_emitter__: Callable[[Any], Awaitable[None]],
-        __model__: Optional[dict] = None,
-        __user__: Optional[dict] = None,
+        __metadata__: dict | None = None,
+        __task__: str | None = None,
+        __id__: str | None = None,
     ) -> dict:
-        """Pre-process: orchestrate the message list before sending to LLM."""
-        self._start_time = time.time()
-        self._user = (__user__ or {}).get("email", "unknown")
-        self._model_id = (__model__ or {}).get("id", "unknown")
-
-        messages = body.get("messages", [])
-        if not messages:
-            return body
-
-        # Fetch live pricing on first call (cached afterwards)
-        if self._pricing_table is None:
-            self._pricing_table = await self._load_pricing()
-
-        conversation = Conversation.from_openai_messages(messages)
-        orchestrator = self._get_orchestrator()
-
-        async def _status_callback(description: str, done: bool) -> None:
-            await __event_emitter__({"type": "status", "data": {"description": description, "done": done}})
-
-        result = await orchestrator.process(
-            conversation,
-            model_id=self._model_id,
-            status_callback=_status_callback,
-        )
-
-        final_msgs = result.conversation.to_openai_messages()
-        self._input_tokens = result.token_count
-        self._input_message_count = len(final_msgs)
-
-        body["messages"] = final_msgs
+        metadata = self._metadata(body, __metadata__)
+        # Internal title/query/tag requests may carry the same chat_id as real dialogue.
+        metadata[self._key(__id__)] = {"skip": bool(__task__ or metadata.get("task"))}
         return body
 
-    def outlet(
+    async def request(
         self,
         body: dict,
-        __model__: Optional[dict] = None,
+        __metadata__: dict | None = None,
+        __user__: dict | None = None,
+        __model__: dict | None = None,
+        __event_emitter__: Emitter | None = None,
+        __chat_id__: str | None = None,
+        __message_id__: str | None = None,
+        __task__: str | None = None,
+        __id__: str | None = None,
     ) -> dict:
-        """Post-process: attach usage stats to the response message."""
-        messages = body.get("messages", [])
-        if not messages:
+        metadata = self._metadata(body, __metadata__)
+        key = self._key(__id__)
+        context = metadata.setdefault(key, {})
+        if __task__ or metadata.get("task") or context.get("skip"):
             return body
-
-        last_msg = messages[-1]
-        counter = TokenCounter()
-        self._output_tokens = counter.count_dict(last_msg)
-
-        if "usage" not in last_msg:
-            last_msg["usage"] = {
-                "prompt_tokens": self._input_tokens,
-                "completion_tokens": self._output_tokens,
-                "total_tokens": self._input_tokens + self._output_tokens,
+        chat_id = __chat_id__ or metadata.get("chat_id") or body.get("chat_id")
+        user_id = (__user__ or {}).get("id") or metadata.get("user_id")
+        if not chat_id or not user_id or not body.get("messages"):
+            # No invented session identity: unscoped API calls remain unchanged.
+            return body
+        manager = self._get_manager()
+        incoming = copy.deepcopy(body["messages"])
+        prior_wire = context.get("wire", [])
+        prior_source = context.get("source", [])
+        if prior_wire and is_prefix(prior_wire, incoming):
+            incoming = prior_source + incoming[len(prior_wire) :]
+        elif prior_source and not is_prefix(prior_source, incoming):
+            # Open WebUI merges instruction messages between provider hops. Restore
+            # omitted originals even when that leading instruction shape has changed.
+            head = instruction_count(incoming)
+            old_head = instruction_count(prior_wire)
+            if is_prefix(prior_wire[old_head:], incoming[head:]):
+                incoming = (
+                    incoming[:head]
+                    + prior_source[instruction_count(prior_source) :]
+                    + incoming[head + len(prior_wire) - old_head :]
+                )
+            elif any(canonical(normalize(m)) in set(context.get("overlays", [])) for m in incoming):
+                raise ValueError(
+                    "Host rewrote compiled history; cannot safely restore original path"
+                )
+        model_info = (__model__ or {}).get("info") or {}
+        environment = {
+            "model_info": model_info,
+            "provider": (__model__ or {}).get("owned_by"),
+            "tools": body.get("tools"),
+            "tool_choice": body.get("tool_choice"),
+            "response_format": body.get("response_format"),
+        }
+        overhead = len(canonical(body.get("tools") or []).encode())
+        if body.get("response_format"):
+            overhead += len(canonical(body["response_format"]).encode())
+        workspace_system = (model_info.get("params") or {}).get("system")
+        if workspace_system:
+            overhead += manager.counter.count([{"role": "system", "content": workspace_system}])
+        reply = body.get("max_completion_tokens", body.get("max_tokens", 0)) or 0
+        if not isinstance(reply, int) or reply < 0:
+            raise ValueError("Invalid reply token limit")
+        overhead += max(0, reply - manager.config.reply_reserve)
+        if __message_id__ and not metadata.get("message_id"):
+            metadata["message_id"] = __message_id__
+        correlation = self._correlation({**metadata, "chat_id": chat_id}, __user__, body)
+        result = await manager.prepare(
+            incoming,
+            chat_id=str(chat_id),
+            user_id=str(user_id),
+            model=str(body.get("model") or (__model__ or {}).get("id") or "default"),
+            environment=environment,
+            extra_tokens=overhead,
+            correlation=correlation,
+        )
+        context.update(
+            {
+                "source": incoming,
+                "wire": copy.deepcopy(result.messages),
+                "overlays": [r.payload for r in result.snapshot.reminders],
+                "request_id": result.request_id,
+                "state_path": self.valves.state_path,
             }
-
-        if self._start_time:
-            elapsed = round(time.time() - self._start_time, 1)
-            logger.info(
-                '{"log_type":"chat_turn","user":"%s","model":"%s",'
-                '"input_tokens":%d,"output_tokens":%d,"elapsed_s":%s,'
-                '"message_count":%d}',
-                self._user,
-                self._model_id,
-                self._input_tokens,
-                self._output_tokens,
-                elapsed,
-                self._input_message_count,
+        )
+        body["messages"] = result.messages
+        log.info(
+            "lethes.context",
+            extra={
+                "lethes": {
+                    "request_id": result.request_id,
+                    "reason": result.reason,
+                    "estimated_tokens": result.estimated_tokens,
+                    "potential_cached_tokens": result.potential_cached_tokens,
+                    "omitted": [asdict(s) for s in result.omitted],
+                    "warnings": result.warnings,
+                    "economics": result.economics,
+                }
+            },
+        )
+        if __event_emitter__:
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": "Historical context ready",
+                        "done": True,
+                        "action": "lethes.context",
+                    },
+                }
             )
-
         return body
 
-    # ── Orchestrator construction (lazy, config-keyed) ────────────────────
-
-    def _get_orchestrator(self) -> ContextOrchestrator:
-        """Return (or rebuild) the orchestrator based on current Valves."""
-        config_key = (
-            self.valves.max_tokens,
-            self.valves.algorithm,
-            self.valves.recency_factor,
-            self.valves.weighting,
-            self.valves.tool_penalty,
-            self.valves.pair_coherence,
-            self.valves.summary_api_base,
-            self.valves.summary_model,
-            self.valves.cache_backend,
-            self.valves.redis_url,
-            self.valves.nosum_by_default,
-            self.valves.llm_analysis,
-            self.valves.llm_analysis_weight,
-        )
-        if self._orchestrator is not None and self._orchestrator_config_key == config_key:
-            return self._orchestrator
-
-        # Cache backend
-        if self.valves.cache_backend == "redis":
-            cache = RedisCache.from_url(self.valves.redis_url)
-        else:
-            cache = InMemoryCache()
-
-        # Summariser (only if API key is set)
-        turn_summarizer: TurnSummarizer | None = None
-        if self.valves.summary_api_key and not self.valves.nosum_by_default:
-            llm = LLMSummarizer(
-                api_base=self.valves.summary_api_base,
-                api_key=self.valves.summary_api_key,
-                model=self.valves.summary_model,
-                retry_attempts=self.valves.retry_attempts,
-            )
-            turn_summarizer = TurnSummarizer(
-                backend=llm,
-                cache=cache,
-                target_ratio=self.valves.summary_target_ratio,
-            )
-
-        # Algorithm
-        base_algo = GreedyByWeightAlgorithm()
-        if self.valves.algorithm == "recency_biased":
-            algo = RecencyBiasedAlgorithm(recency_factor=self.valves.recency_factor)
-        elif self.valves.algorithm == "dependency_aware":
-            algo = DependencyAwareAlgorithm(inner=base_algo)
-        else:
-            algo = base_algo
-
-        # Base weighting strategy
-        if self.valves.weighting == "keyword":
-            base_weighting = KeywordRelevanceStrategy()
-        elif self.valves.weighting == "smart":
-            base_weighting = SmartWeightingStrategy(
-                tool_penalty=self.valves.tool_penalty,
-                pair_coherence=self.valves.pair_coherence,
-            )
-        else:
-            base_weighting = StaticWeightStrategy()
-
-        # Optionally wrap with LLM context analyser
-        weighting = base_weighting
-        if self.valves.llm_analysis and self.valves.summary_api_key:
-            analyzer = LLMContextAnalyzer(
-                api_base=self.valves.summary_api_base,
-                api_key=self.valves.summary_api_key,
-                model=self.valves.summary_model,
-                cache=cache,
-            )
-            w = self.valves.llm_analysis_weight
-            weighting = CompositeWeightStrategy([
-                (base_weighting, 1.0 - w),
-                (analyzer, w),
-            ])
-
-        self._orchestrator = ContextOrchestrator(
-            budget=TokenBudget(max_tokens=self.valves.max_tokens),
-            algorithm=algo,
-            weighting=weighting,
-            turn_summarizer=turn_summarizer,
-            cache=cache,
-            pricing_table=self._pricing_table,
-            constraints=ConstraintSet(
-                min_chat_messages=1,
-                require_last_user=True,
-            ),
-        )
-        self._orchestrator_config_key = config_key
-        return self._orchestrator
-
-    async def _load_pricing(self) -> ModelPricingTable:
-        """Load pricing table: custom JSON path → OpenRouter live → empty."""
-        if self.valves.pricing_config_path:
+    async def stream(
+        self, event: dict, __metadata__: dict | None = None, __id__: str | None = None
+    ) -> dict:
+        context = (__metadata__ or {}).get(self._key(__id__), {})
+        data = event.get("data")
+        if isinstance(data, str):
             try:
-                return ModelPricingTable.from_json(self.valves.pricing_config_path)
-            except Exception:
-                logger.warning("pricing.load_failed", path=self.valves.pricing_config_path)
+                data = json.loads(data.removeprefix("data:").strip())
+            except ValueError:
+                data = {}
+        if not isinstance(data, dict):
+            data = {}
+        message = event.get("message") or data.get("message") or {}
+        usage = event.get("usage") or data.get("usage")
+        if not usage and isinstance(message, dict):
+            usage = message.get("usage")
+        if isinstance(usage, dict) and context.get("request_id"):
+            self._record_usage(context, context["request_id"], usage)
+        return event
 
-        if self.valves.openrouter_pricing:
+    def _record_usage(self, context: dict, request_id: str, usage: dict) -> None:
+        path = context.get("state_path", self.valves.state_path)
+        if path == self.valves.state_path:
+            self._get_manager().record_usage(request_id, usage)
+        else:
+            # A valve change must not redirect an in-flight response to a different database.
+            store = SQLiteStore(path)
             try:
-                table = await ModelPricingTable.from_openrouter_async()
-                logger.info("pricing.openrouter_loaded", n_models=len(table._entries))
-                return table
-            except Exception as exc:
-                logger.warning("pricing.openrouter_failed", error=str(exc))
+                ContextManager(store=store).record_usage(request_id, usage)
+            finally:
+                store.close()
 
-        return ModelPricingTable.empty()
+    async def outlet(
+        self,
+        body: dict,
+        __metadata__: dict | None = None,
+        __user__: dict | None = None,
+        __id__: str | None = None,
+    ) -> dict:
+        metadata = __metadata__ or {}
+        context = metadata.get(self._key(__id__), {})
+        usage = body.get("usage")
+        if not usage and body.get("messages"):
+            usage = body["messages"][-1].get("usage")
+        if isinstance(usage, dict):
+            manager = self._get_manager()
+            request_id = context.get("request_id") or manager.store.correlated_request(
+                self._correlation(metadata, __user__, body)
+            )
+            if request_id:
+                self._record_usage(context, request_id, usage)
+        return body
